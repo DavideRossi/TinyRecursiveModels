@@ -1,0 +1,52 @@
+Bootstrap: docker
+From: nvidia/cuda:12.6.3-cudnn-devel-ubuntu22.04
+
+# Software-only image for TinyRecursiveModels.
+# Code, data and checkpoints live outside the image (bind-mounted at run time).
+# Versions follow specific_requirements.txt.
+
+%environment
+    export LC_ALL=C.UTF-8
+    export LANG=C.UTF-8
+    export PYTHONUNBUFFERED=1
+
+%post
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        python3.10 python3.10-dev python3-pip git build-essential ca-certificates
+    rm -rf /var/lib/apt/lists/*
+    ln -sf /usr/bin/python3.10 /usr/bin/python
+
+    python -m pip install --no-cache-dir --upgrade pip wheel==0.45.1 setuptools==80.9.0
+
+    python -m pip install --no-cache-dir torch==2.7.0 \
+        --index-url https://download.pytorch.org/whl/cu126
+
+    python -m pip install --no-cache-dir \
+        triton==3.3.0 \
+        einops==0.8.1 \
+        tqdm==4.67.1 \
+        coolname==2.2.0 \
+        pydantic==2.11.7 \
+        pydantic-core==2.33.2 \
+        argdantic==1.3.3 \
+        wandb==0.21.3 \
+        omegaconf==2.3.0 \
+        hydra-core==1.3.2 \
+        huggingface_hub==0.34.4 \
+        packaging==24.1 \
+        ninja==1.13.0 \
+        setuptools-scm==9.2.0 \
+        numba==0.61.2
+
+    # adam-atan2 compiles a CUDA extension. The build node has no GPU, so the
+    # target architecture must be given explicitly (L40S = Ada, sm_89).
+    export TORCH_CUDA_ARCH_LIST="8.9"
+    python -m pip install --no-cache-dir --no-build-isolation adam-atan2==0.0.3
+
+    # Fail the build early if anything is missing.
+    python -c "import torch, triton, adam_atan2, hydra, wandb; print('torch', torch.__version__, 'cuda', torch.version.cuda)"
+
+%labels
+    Description TinyRecursiveModels training environment (torch 2.7.0 / CUDA 12.6)
