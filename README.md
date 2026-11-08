@@ -23,18 +23,21 @@ Tiny Recursion Model (TRM) recursively improves its predicted answer y with a ti
 
 ### Requirements
 
-Installation should take a few minutes. For the smallest experiments on Sudoku-Extreme (pretrain_mlp_t_sudoku), you need 1 GPU with enough memory. With 1 L40S (48Gb Ram), it takes around 18h to finish. In case that you run into issues due to library versions, here is the requirements with the exact versions used: [specific_requirements.txt](https://github.com/SamsungSAILMontreal/TinyRecursiveModels/blob/main/specific_requirements.txt).
+Installation should take a few minutes. For the smallest experiments on Sudoku-Extreme (pretrain_mlp_t_sudoku), you need 1 GPU with enough memory. With 1 L40S (48Gb Ram), it takes around 18h to finish. In case that you run into issues due to library versions, here is the requirements with the exact versions tested: [specific_requirements.txt](specific_requirements.txt).
 
-- Python 3.10 (or similar)
-- Cuda 12.6.0 (or similar)
+- Python 3.12 (3.11+)
+- A recent NVIDIA driver (>= 580 for the CUDA 13.0 PyTorch wheels below)
 
 ```bash
-pip install --upgrade pip wheel setuptools
-pip install --pre --upgrade torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu126 # install torch based on your cuda version
+pip install --upgrade pip
+pip install torch --index-url https://download.pytorch.org/whl/cu130 # pick the CUDA version your driver supports
 pip install -r requirements.txt # install requirements
-pip install --no-cache-dir --no-build-isolation adam-atan2 
 wandb login YOUR-LOGIN # login if you want the logger to sync results to your Weights & Biases (https://wandb.ai/)
 ```
+
+The AdamATan2 optimizer is implemented in pure PyTorch ([models/adam_atan2.py](models/adam_atan2.py)), so no CUDA extension needs to be compiled.
+
+An Apptainer/Slurm setup (container definition and job scripts) is in [slurm/](slurm/).
 
 ### Dataset Preparation
 

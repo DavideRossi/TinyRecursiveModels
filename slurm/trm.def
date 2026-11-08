@@ -1,13 +1,20 @@
 Bootstrap: docker
-From: nvidia/cuda:12.6.3-cudnn-devel-ubuntu24.04
+From: ubuntu:24.04
 
 # Software-only image for TinyRecursiveModels.
 # Code, data and checkpoints live outside the image (bind-mounted at run time).
 # Versions follow specific_requirements.txt.
 #
-# Ubuntu 24.04 (glibc 2.39) is required: the cluster's Apptainer injects a
-# libfakeroot that needs glibc >= 2.38, so a 22.04 base fails in %post.
-# 24.04 ships Python 3.12 and forbids system-wide pip (PEP 668), hence the venv.
+# - A plain Ubuntu base is enough: the PyTorch wheels bundle the CUDA runtime
+#   libraries, and the GPU driver comes from the host via `apptainer --nv`.
+#   No custom CUDA extension is compiled anymore (AdamATan2 is pure PyTorch,
+#   see models/adam_atan2.py), so no CUDA toolkit/nvcc is needed.
+# - Ubuntu 24.04 (glibc 2.39) is required: the cluster's Apptainer injects a
+#   libfakeroot that needs glibc >= 2.38.
+# - torch is built for CUDA 13.0, the newest CUDA the cluster driver (580) supports.
+# - build-essential + python3-dev stay: Triton (used by torch.compile) compiles
+#   a small C launcher at runtime.
+# - 24.04 ships Python 3.12 and forbids system-wide pip (PEP 668), hence the venv.
 
 %environment
     export LC_ALL=C.UTF-8
@@ -20,41 +27,33 @@ From: nvidia/cuda:12.6.3-cudnn-devel-ubuntu24.04
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
     apt-get install -y --no-install-recommends \
-        python3 python3-dev python3-venv git build-essential ca-certificates
+        python3 python3-dev python3-venv build-essential ca-certificates
     rm -rf /var/lib/apt/lists/*
 
     python3 -m venv /opt/venv
     PY=/opt/venv/bin/python
 
-    $PY -m pip install --no-cache-dir --upgrade pip wheel==0.45.1 setuptools==80.9.0
+    $PY -m pip install --no-cache-dir --upgrade pip
 
-    $PY -m pip install --no-cache-dir torch==2.7.0 \
-        --index-url https://download.pytorch.org/whl/cu126
+    $PY -m pip install --no-cache-dir torch==2.14.1 \
+        --index-url https://download.pytorch.org/whl/cu130
 
     $PY -m pip install --no-cache-dir \
-        triton==3.3.0 \
-        einops==0.8.1 \
-        tqdm==4.67.1 \
-        coolname==2.2.0 \
-        pydantic==2.11.7 \
-        pydantic-core==2.33.2 \
+        numpy==2.5.4 \
+        einops==0.8.2 \
+        tqdm==4.70.1 \
+        coolname==5.0.0 \
+        pydantic==2.14.3 \
         argdantic==1.3.3 \
-        wandb==0.21.3 \
+        pyyaml==6.0.3 \
+        wandb==0.31.0 \
         omegaconf==2.3.0 \
-        hydra-core==1.3.2 \
-        huggingface_hub==0.34.4 \
-        packaging==24.1 \
-        ninja==1.13.0 \
-        setuptools-scm==9.2.0 \
-        numba==0.61.2
-
-    # adam-atan2 compiles a CUDA extension. The build node has no GPU, so the
-    # target architecture must be given explicitly (L40S = Ada, sm_89).
-    export TORCH_CUDA_ARCH_LIST="8.9"
-    $PY -m pip install --no-cache-dir --no-build-isolation adam-atan2==0.0.3
+        hydra-core==1.3.8 \
+        huggingface_hub==2.4.0 \
+        numba==0.68.1
 
     # Fail the build early if anything is missing.
-    $PY -c "import torch, triton, adam_atan2, hydra, wandb; print('torch', torch.__version__, 'cuda', torch.version.cuda)"
+    $PY -c "import torch, triton, numba, hydra, wandb; print('torch', torch.__version__, 'cuda', torch.version.cuda, 'triton', triton.__version__)"
 
 %labels
-    Description TinyRecursiveModels training environment (torch 2.7.0 / CUDA 12.6)
+    Description TinyRecursiveModels training environment (torch 2.14.1 / CUDA 13.0)
