@@ -4,14 +4,23 @@ Usage (inside the container, from the repo root):
     apptainer exec /scratch.hpc/$USER/trm.sif python slurm/read_wandb_offline.py [RUN_DIR_OR_.wandb_FILE]
 
 With no argument, the most recent wandb/offline-run-* directory is used.
+
+The .wandb file is a LevelDB-style record log of protobuf `Record`s. wandb no
+longer ships a Python reader for it (it moved into the compiled wandb-core),
+so the small reader below is self-contained; only the protobuf definitions
+are taken from the installed wandb package.
 """
 import glob
 import json
 import os
+import struct
 import sys
 
 from wandb.proto import wandb_internal_pb2 as pb
-from wandb.sdk.internal.datastore import DataStore
+
+HEADER_LEN = 7          # file header: "<4sHB" ident, magic, version; record header: "<IHB" crc, length, type
+BLOCK_LEN = 32768
+FULL, FIRST, MIDDLE, LAST = 1, 2, 3, 4
 
 
 def find_wandb_file(arg):
@@ -28,6 +37,40 @@ def find_wandb_file(arg):
     return arg
 
 
+def read_records(path):
+    """Yield raw protobuf payloads. Stops quietly at a truncated tail (run still writing)."""
+    with open(path, "rb") as f:
+        ident, _magic, _version = struct.unpack("<4sHB", f.read(HEADER_LEN))
+        if ident != b":W&B":
+            sys.exit(f"{path} is not a wandb transaction log")
+        pos = HEADER_LEN
+        pending = b""
+        while True:
+            space_left = BLOCK_LEN - pos % BLOCK_LEN
+            if space_left < HEADER_LEN:  # block trailer padding
+                f.read(space_left)
+                pos += space_left
+            header = f.read(HEADER_LEN)
+            if len(header) < HEADER_LEN:
+                return
+            _crc, length, rtype = struct.unpack("<IHB", header)
+            data = f.read(length)
+            if len(data) < length:
+                return
+            pos += HEADER_LEN + length
+            if rtype == FULL:
+                yield data
+            elif rtype == FIRST:
+                pending = data
+            elif rtype == MIDDLE:
+                pending += data
+            elif rtype == LAST:
+                yield pending + data
+                pending = b""
+            else:
+                return  # zero padding / unknown: treat as end of valid data
+
+
 def flatten(prefix, value, out):
     if isinstance(value, dict):
         for k, v in value.items():
@@ -37,15 +80,7 @@ def flatten(prefix, value, out):
 
 
 def history_rows(path):
-    ds = DataStore()
-    ds.open_for_scan(path)
-    while True:
-        try:
-            data = ds.scan_data()
-        except AssertionError:  # truncated tail while the run is still writing
-            break
-        if data is None:
-            break
+    for data in read_records(path):
         rec = pb.Record()
         rec.ParseFromString(data)
         if rec.WhichOneof("record_type") != "history":
