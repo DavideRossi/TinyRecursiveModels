@@ -17,7 +17,7 @@ import coolname
 import hydra
 import pydantic
 from omegaconf import DictConfig
-from adam_atan2 import AdamATan2
+from models.adam_atan2 import AdamATan2
 
 from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMetadata
 from utils.functions import load_model_class, get_model_source_path
@@ -246,7 +246,7 @@ def load_checkpoint(model: nn.Module, config: PretrainConfig):
         print(f"Loading checkpoint {config.load_checkpoint}")
 
         # Load state dict
-        state_dict = torch.load(config.load_checkpoint, map_location="cuda")
+        state_dict = torch.load(config.load_checkpoint, map_location="cuda", weights_only=True)
 
         # Resize and reset puzzle emb if needed
         puzzle_emb_name = "_orig_mod.model.inner.puzzle_emb.weights"
@@ -587,7 +587,7 @@ def launch(hydra_config: DictConfig):
     ema_helper = None
     if RANK == 0:
         progress_bar = tqdm.tqdm(total=train_state.total_steps)
-        wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump(), settings=wandb.Settings(_disable_stats=True))  # type: ignore
+        wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump(), settings=wandb.Settings(x_disable_stats=True))  # type: ignore
         wandb.log({"num_params": sum(x.numel() for x in train_state.model.parameters())}, step=0)
         save_code_and_config(config)
     if config.ema:
