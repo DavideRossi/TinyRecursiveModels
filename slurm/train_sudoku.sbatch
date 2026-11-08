@@ -3,7 +3,8 @@
 # ~18h on 1 L40S, expected ~87% exact accuracy). Submit from the repo root:
 #   sbatch slurm/train_sudoku.sbatch
 # Extra Hydra overrides can be appended, e.g. for a smoke test:
-#   sbatch --time=00:30:00 slurm/train_sudoku.sbatch epochs=100 eval_interval=50
+#   RUN_NAME=smoke sbatch --time=00:30:00 slurm/train_sudoku.sbatch epochs=100 eval_interval=50
+# Set the run name via RUN_NAME (not +run_name=..., which this script already passes).
 #SBATCH --job-name=trm_sudoku_mlp
 #SBATCH --partition=l40s
 #SBATCH --gres=gpu:1
