@@ -38,6 +38,23 @@ def softmax_cross_entropy(logits, labels, ignore_index: int = -100):
     return F.cross_entropy(logits.to(torch.float32).view(-1, logits.shape[-1]), labels.to(torch.long).view(-1), ignore_index=ignore_index, reduction="none").view(labels.shape)
 
 
+def compute_correctness(preds: torch.Tensor, labels: torch.Tensor):
+    """Per-cell and per-sequence correctness, ignoring IGNORE_LABEL_ID cells.
+
+    Returns (mask, loss_counts, is_correct, seq_is_correct). A sequence is correct when every
+    non-ignored cell is predicted correctly (sequences with no valid cells count as correct;
+    callers exclude them via loss_counts > 0).
+    """
+    mask = (labels != IGNORE_LABEL_ID)
+    loss_counts = mask.sum(-1)
+    is_correct = mask & (preds == labels)
+    seq_is_correct = is_correct.sum(-1) == loss_counts
+    return mask, loss_counts, is_correct, seq_is_correct
+
+
+AUX_HALT_LOGITS_KEY = "aux_halt_logits"
+
+
 class ACTLossHead(nn.Module):
     def __init__(self, model: nn.Module, loss_type: str):
         super().__init__()
@@ -63,12 +80,8 @@ class ACTLossHead(nn.Module):
             outputs["preds"] = torch.argmax(outputs["logits"], dim=-1)
 
             # Correctness
-            mask = (labels != IGNORE_LABEL_ID)
-            loss_counts = mask.sum(-1)
+            mask, loss_counts, is_correct, seq_is_correct = compute_correctness(outputs["preds"], labels)
             loss_divisor = loss_counts.clamp_min(1).unsqueeze(-1)  # Avoid NaNs in division
-
-            is_correct = mask & (torch.argmax(outputs["logits"], dim=-1) == labels)
-            seq_is_correct = is_correct.sum(-1) == loss_counts
             
             # Metrics (halted)
             valid_metrics = new_carry.halted & (loss_counts > 0)
@@ -81,6 +94,11 @@ class ACTLossHead(nn.Module):
                 "q_halt_accuracy": (valid_metrics & ((outputs["q_halt_logits"] >= 0) == seq_is_correct)).sum(),
                 "steps":          torch.where(valid_metrics, new_carry.steps, 0).sum(),
             }
+
+            # Auxiliary halting heads: same accuracy definition as q_halt_accuracy
+            aux_halt_logits: Dict[str, torch.Tensor] = outputs.get(AUX_HALT_LOGITS_KEY, {})
+            for name, aux_logit in aux_halt_logits.items():
+                metrics[f"aux_{name}_q_halt_accuracy"] = (valid_metrics & ((aux_logit >= 0) == seq_is_correct)).sum()
 
         # Losses
 
@@ -96,8 +114,27 @@ class ACTLossHead(nn.Module):
             q_continue_loss = F.binary_cross_entropy_with_logits(outputs["q_continue_logits"], outputs["target_q_continue"], reduction="sum")
 
             metrics["q_continue_loss"] = q_continue_loss.detach()
-        # Filter outputs for return
-        detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
 
-        return new_carry, lm_loss + 0.5 * (q_halt_loss + q_continue_loss), metrics, detached_outputs, new_carry.halted.all()
+        total_loss = lm_loss + 0.5 * (q_halt_loss + q_continue_loss)
+
+        # Auxiliary halting heads: same target, samples and weight as q_halt_loss. Their logits are
+        # computed from detached state, so this term only produces gradients for the heads themselves.
+        if len(aux_halt_logits):
+            aux_loss_total = 0
+            for name, aux_logit in aux_halt_logits.items():
+                aux_loss = F.binary_cross_entropy_with_logits(aux_logit, seq_is_correct.to(aux_logit.dtype), reduction="sum")
+                metrics[f"aux_{name}_q_halt_loss"] = aux_loss.detach()
+                aux_loss_total = aux_loss_total + aux_loss
+            total_loss = total_loss + 0.5 * aux_loss_total
+
+        # Filter outputs for return. Auxiliary logits are flattened to "aux_halt_logits/<name>";
+        # requesting "aux_halt_logits" returns all of them.
+        flat_outputs = {k: v for k, v in outputs.items() if k != AUX_HALT_LOGITS_KEY}
+        flat_outputs.update({f"{AUX_HALT_LOGITS_KEY}/{name}": v for name, v in aux_halt_logits.items()})
+        wanted = set(return_keys)
+        if AUX_HALT_LOGITS_KEY in wanted:
+            wanted.update(f"{AUX_HALT_LOGITS_KEY}/{name}" for name in aux_halt_logits)
+        detached_outputs = {k: v.detach() for k, v in flat_outputs.items() if k in wanted}
+
+        return new_carry, total_loss, metrics, detached_outputs, new_carry.halted.all()
 

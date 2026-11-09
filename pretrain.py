@@ -16,7 +16,7 @@ import wandb
 import coolname
 import hydra
 import pydantic
-from omegaconf import DictConfig
+from omegaconf import DictConfig, ListConfig, OmegaConf
 from models.adam_atan2 import AdamATan2
 
 from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMetadata
@@ -34,6 +34,15 @@ class ArchConfig(pydantic.BaseModel):
     model_config = pydantic.ConfigDict(extra='allow')
     name: str
     loss: LossConfig
+
+    @pydantic.model_validator(mode="after")
+    def _plain_container_extras(self):
+        # List/dict-valued arch options (e.g. aux_halt_heads) arrive as OmegaConf containers;
+        # store them as plain Python objects so they dump cleanly to YAML and wandb.
+        for k, v in (self.__pydantic_extra__ or {}).items():
+            if isinstance(v, (DictConfig, ListConfig)):
+                self.__pydantic_extra__[k] = OmegaConf.to_container(v, resolve=True)  # type: ignore
+        return self
 
 
 class EvaluatorConfig(pydantic.BaseModel):
@@ -247,6 +256,21 @@ def load_checkpoint(model: nn.Module, config: PretrainConfig):
 
         # Load state dict
         state_dict = torch.load(config.load_checkpoint, map_location="cuda", weights_only=True)
+
+        # Auxiliary halting heads: checkpoints may lack them (keep the fresh init) or contain heads
+        # that are not configured (drop them). All other keys are still loaded strictly.
+        model_state = model.state_dict()
+        is_aux_key = lambda k: ".aux_halt_heads." in f".{k}"
+        missing_aux = [k for k in model_state if is_aux_key(k) and k not in state_dict]
+        unexpected_aux = [k for k in state_dict if is_aux_key(k) and k not in model_state]
+        for k in missing_aux:
+            state_dict[k] = model_state[k]
+        for k in unexpected_aux:
+            del state_dict[k]
+        if missing_aux:
+            print(f"Auxiliary halt head weights not in checkpoint, using fresh init: {missing_aux}")
+        if unexpected_aux:
+            print(f"Ignoring auxiliary halt head weights not used by this model: {unexpected_aux}")
 
         # Resize and reset puzzle emb if needed
         puzzle_emb_name = "_orig_mod.model.inner.puzzle_emb.weights"

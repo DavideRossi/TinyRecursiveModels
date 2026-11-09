@@ -45,12 +45,17 @@ class CastedLinear(nn.Module):
     def __init__(self,
                  in_features: int,
                  out_features: int,
-                 bias: bool):
+                 bias: bool,
+                 zero_init: bool = False):
         super().__init__()
-        # Truncated LeCun normal init
-        self.weight = nn.Parameter(
-            trunc_normal_init_(torch.empty((out_features, in_features)), std=1.0 / (in_features ** 0.5))
-        )
+        if zero_init:
+            # Zero weights, created without consuming any random numbers
+            self.weight = nn.Parameter(torch.zeros((out_features, in_features)))
+        else:
+            # Truncated LeCun normal init
+            self.weight = nn.Parameter(
+                trunc_normal_init_(torch.empty((out_features, in_features)), std=1.0 / (in_features ** 0.5))
+            )
         self.bias = None
         if bias:
             # Zero init bias
