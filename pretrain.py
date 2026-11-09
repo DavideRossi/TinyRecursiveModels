@@ -23,6 +23,7 @@ from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMeta
 from utils.functions import load_model_class, get_model_source_path
 from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
 from models.ema import EMAHelper
+from models.losses import compute_correctness, AUX_HALT_LOGITS_KEY
 
 
 class LossConfig(pydantic.BaseModel):
@@ -87,6 +88,9 @@ class PretrainConfig(pydantic.BaseModel):
     eval_interval: Optional[int] = None
     min_eval_interval: Optional[int] = 0 # when to start eval
     eval_save_outputs: List[str] = []
+    # Per-step capture during evaluation: halt logits (original + auxiliary heads) and per-puzzle
+    # correctness at every ACT step, saved to checkpoint_path/step_<N>_eval_steps.<rank>
+    eval_capture_steps: bool = False
 
     ema: bool = False # use Exponential-Moving-Average
     ema_rate: float = 0.999 # EMA-rate
@@ -384,6 +388,14 @@ def evaluate(
             evaluator.begin_eval()
             return_keys.update(evaluator.required_outputs)
 
+        # Optional per-step capture (compact: halt logits + correctness per puzzle and step)
+        capture_steps = config.eval_capture_steps
+        if capture_steps:
+            return_keys.update({"preds", "q_halt_logits", AUX_HALT_LOGITS_KEY})
+            local_batch_size = eval_loader.dataset.local_batch_size  # type: ignore
+            set_next_start = {}  # set name -> global start index of its next batch (mirrors PuzzleDataset._iter_test)
+            captured = {}  # quantity -> list of per-batch CPU tensors
+
         # Run evaluation
         set_ids = {k: idx for idx, k in enumerate(eval_metadata.sets)}
 
@@ -407,14 +419,37 @@ def evaluate(
 
             # Forward
             inference_steps = 0
+            step_records = {}  # quantity -> list over steps of [B] tensors (on device)
             while True:
                 carry, loss, metrics, preds, all_finish = train_state.model(
                     carry=carry, batch=batch, return_keys=return_keys
                 )
                 inference_steps += 1
 
+                if capture_steps:
+                    step_records.setdefault("q_halt_logits", []).append(preds["q_halt_logits"])
+                    for k, v in preds.items():
+                        if k.startswith(AUX_HALT_LOGITS_KEY + "/"):
+                            step_records.setdefault(k, []).append(v)
+                    step_records.setdefault("seq_is_correct", []).append(compute_correctness(preds["preds"], batch["labels"])[3])
+
                 if all_finish:
                     break
+
+            if capture_steps:
+                # Global example indices of this rank's rows; padding rows are dropped
+                batch_start = set_next_start.get(set_name, 0)
+                set_next_start[set_name] = batch_start + config.global_batch_size
+                local_start = batch_start + rank * local_batch_size
+                num_valid = max(0, min(batch_start + (rank + 1) * local_batch_size, batch_start + global_batch_size) - local_start)
+
+                for k, v in step_records.items():
+                    captured.setdefault(k, []).append(torch.stack(v, dim=1)[:num_valid].cpu())
+                captured.setdefault("puzzle_identifiers", []).append(batch["puzzle_identifiers"][:num_valid].cpu())
+                captured.setdefault("example_index", []).append(torch.arange(local_start, local_start + num_valid, dtype=torch.int64))
+                captured.setdefault("set_id", []).append(torch.full((num_valid, ), set_ids[set_name], dtype=torch.int32))
+                captured.setdefault("num_steps", []).append(torch.full((num_valid, ), inference_steps, dtype=torch.int32))
+                del step_records
 
             if rank == 0:
                 print(f"  Completed inference in {inference_steps} steps")
@@ -457,6 +492,32 @@ def evaluate(
             )
 
         del save_preds
+
+        # Save per-step capture
+        if capture_steps and config.checkpoint_path is not None:
+            max_steps = max((t.shape[1] for t in captured.get("seq_is_correct", [])), default=0)
+
+            def _cat(k: str, tensors: List[torch.Tensor]) -> torch.Tensor:
+                if tensors[0].ndim == 1:
+                    return torch.cat(tensors, dim=0)
+                # [num_puzzles, num_steps]; pad batches that finished early (not expected in eval:
+                # every sequence runs halt_max_steps) with False / NaN. num_steps records the real count.
+                fill = False if tensors[0].dtype == torch.bool else float("nan")
+                padded = []
+                for t in tensors:
+                    if t.shape[1] < max_steps:
+                        full = torch.full((t.shape[0], max_steps), fill, dtype=t.dtype)
+                        full[:, :t.shape[1]] = t
+                        t = full
+                    padded.append(t)
+                return torch.cat(padded, dim=0)
+
+            step_capture = {k: _cat(k, v) for k, v in captured.items()}
+            step_capture["set_names"] = list(set_ids.keys())
+
+            os.makedirs(config.checkpoint_path, exist_ok=True)
+            torch.save(step_capture, os.path.join(config.checkpoint_path, f"step_{train_state.step}_eval_steps.{rank}"))
+            del captured, step_capture
 
         # Reduce to rank 0
         if metric_values is not None:
