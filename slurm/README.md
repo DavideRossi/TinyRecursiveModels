@@ -144,6 +144,21 @@ solved completely; expect ~87% ± 2% at the end. There are two ways to read it:
     python slurm/read_wandb_offline.py            # newest run, or pass a run dir
   ```
 
+  This prints the evaluation metrics only. Add `--train` for the training
+  metrics (`train/*`, logged every step), shown as one row per 1000 steps
+  (`--window N`) with the mean over each window. `--last K` keeps the last K
+  rows, and `--keys` keeps only metrics whose names contain one of the given
+  strings. For example, to follow the halting heads of a running job:
+
+  ```bash
+  ... python slurm/read_wandb_offline.py --train --keys halt steps --last 10
+  ```
+
+  Training accuracies and `steps` are measured on the sequences that halted in
+  each step, so they show how halting behaves during training. In evaluation
+  every sequence runs all `halt_max_steps` steps, so the `all/` halting metrics
+  only describe the last step.
+
 - **On the wandb website.** Sync from an `sbuild` node, passing your API key
   through the environment:
 
@@ -158,6 +173,90 @@ solved completely; expect ~87% ± 2% at the end. There are two ways to read it:
   logs online directly. This only works if the GPU nodes have internet access;
   check with `srun -p l40s --gres=gpu:1 curl -sI https://api.wandb.ai`.
 
+## 7. Run from a different branch
+
+Jobs run the code in the directory they are submitted from, so use **one
+checkout per branch**. Switching branches in a checkout that a job is using
+changes that job's code under its feet.
+
+### Make a checkout for the branch
+
+Push the branch from your machine first (`git push -u origin <branch>`), then on
+the login node:
+
+```bash
+cd /scratch.hpc/$USER
+git clone -b <branch> https://github.com/DavideRossi/TinyRecursiveModels.git TRM-<branch>
+cd TRM-<branch>
+mkdir -p slurm/logs                                       # skip if git already created it
+ln -s /scratch.hpc/$USER/TinyRecursiveModels/data data    # reuse the dataset
+```
+
+To update an existing checkout instead, check that no job is running from it,
+then `git fetch origin && git checkout <branch> && git pull`.
+
+### Check whether the branch needs another image
+
+The image only has to match `slurm/trm.def`. If the branch doesn't change that
+file, any image built from the same `trm.def` works. Compare the definition
+files of the two checkouts:
+
+```bash
+diff /scratch.hpc/$USER/TinyRecursiveModels/slurm/trm.def slurm/trm.def
+```
+
+Or ask an image which PyTorch it contains, and compare it with the version
+pinned in `slurm/trm.def`:
+
+```bash
+srun -p sbuild apptainer exec --bind /scratch.hpc/$USER /scratch.hpc/$USER/trm.sif \
+  python -c "import torch; print(torch.__version__, torch.version.cuda)"
+```
+
+### Build an image for the branch (only if needed)
+
+Give it its own name, so the image other checkouts use stays as it is:
+
+```bash
+SIF=/scratch.hpc/$USER/trm-<branch>.sif sbatch slurm/build_image.sbatch
+```
+
+Monitor the build:
+
+```bash
+squeue -u $USER                                         # ST: PD = queued, R = running; gone = finished
+tail -f slurm/logs/trm_build_image_<jobid>.out          # live log; Ctrl-C stops watching, not the build
+sacct -j <jobid> --format=JobID,State,Elapsed,ExitCode  # COMPLETED and 0:0 = success
+scancel <jobid>                                         # cancel
+```
+
+Most of the time goes to downloading and installing PyTorch with its CUDA
+libraries (several GB). The last step, packing the `.sif`, can print nothing for
+several minutes. A successful build ends with the import check's version line.
+Check the image afterwards:
+
+```bash
+ls -lh /scratch.hpc/$USER/trm-<branch>.sif
+srun -p sbuild apptainer exec --bind /scratch.hpc/$USER /scratch.hpc/$USER/trm-<branch>.sif \
+  python -c "import torch, triton; print(torch.__version__, torch.version.cuda, triton.__version__)"
+```
+
+### Train
+
+Pass the image with `SIF=...` on every submission from this checkout (and in
+the `srun ... apptainer exec` commands of section 6). Give each run a distinct
+`RUN_NAME`, so its checkpoints don't mix with other runs'. For example, on the
+`aux-halt-heads` branch:
+
+```bash
+SIF=/scratch.hpc/$USER/trm-<branch>.sif RUN_NAME=sudoku_aux_linear \
+  sbatch slurm/train_sudoku.sbatch \
+  'arch.aux_halt_heads=[{type:detached_linear}]' eval_capture_steps=True
+```
+
+The first run of a branch that changes model code is a good time for one of the
+quick checks of section 4.
+
 ## Troubleshooting
 
 | Symptom | Cause / fix |
@@ -167,4 +266,5 @@ solved completely; expect ~87% ± 2% at the end. There are two ways to read it:
 | `Could not append to config. An item is already at 'run_name'` | You passed `+run_name=...`. Use `RUN_NAME=...` instead. |
 | No log file appears | `slurm/logs/` is missing (Slurm does not create it), or you submitted from outside the repo root. |
 | Job killed at the time limit | Check `--time` against the partition limit: `sinfo -p l40s -o "%P %l"` (3 days at the time of writing). |
+| `WARNING: Error changing the container working directory. Using '<home>' instead` | The current directory is under scratch (possibly through a symlink such as `~/scratch`), but scratch isn't mounted in the container. Add `--bind /scratch.hpc/$USER` to `apptainer exec`. Harmless for commands that read no files, but anything using relative paths would run in your home directory. |
 | `torch.cuda.is_available()` is False | `--nv` is missing from `apptainer exec`, or the job didn't request `--gres=gpu:1`. |
