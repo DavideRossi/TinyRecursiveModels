@@ -125,9 +125,76 @@ def test_bootstrap_interval():
     assert abs(half - 1.96 * np.sqrt(acc * (1 - acc) / P)) < 0.003
 
 
-def _write_rank(path, logits_q, logits_aux, correct, example_index, set_id, set_names):
+def test_unchanged_among_unsolved():
+    correct = np.array([[0, 0, 0, 1],
+                        [0, 0, 0, 0],
+                        [1, 1, 0, 0],
+                        [0, 1, 1, 1]], dtype=bool)
+    changed = np.array([[0, 1, 0, 1],
+                        [0, 0, 0, 0],
+                        [0, 0, 1, 0],
+                        [0, 1, 0, 0]], dtype=bool)
+    out = hc.unchanged_among_unsolved(correct, changed)
+    assert out[0] is None
+    # step 2: wrong at step 1 = rows 0, 1, 3; unchanged at step 2 = row 1
+    assert (out[1]["step"], out[1]["unsolved_at_previous_step"], out[1]["unchanged"]) == (2, 3, 1)
+    # step 3: wrong at step 2 = rows 0, 1; both unchanged
+    assert (out[2]["unsolved_at_previous_step"], out[2]["unchanged"], out[2]["share"]) == (2, 2, 1.0)
+    # step 4: wrong at step 3 = rows 0, 1, 2; unchanged = rows 1, 2
+    assert (out[3]["unsolved_at_previous_step"], out[3]["unchanged"]) == (3, 2)
+
+
+def test_truncation_equals_shorter_capture():
+    """Analyzing the first K steps of a 32-step capture = analyzing a K-step capture."""
+    rng = np.random.default_rng(5)
+    P, S, K = 800, 32, 16
+    logits = rng.normal(size=(P, S)).cumsum(axis=1).astype(np.float32)
+    correct = rng.random((P, S)) < 1 / (1 + np.exp(-logits / 3))
+    changed = rng.random((P, S)) < 0.5
+    changed[:, 0] = False
+    with tempfile.TemporaryDirectory() as d:
+        for step, n in [(1, S), (2, K)]:
+            _write_rank(os.path.join(d, f"step_{step}_eval_steps.0"), logits[:, :n], logits[:, :n] * 0.5 + 1,
+                        correct[:, :n], np.arange(P), np.zeros(P), ["all"], preds_changed=changed[:, :n])
+        full = hc.run(d, 1, os.path.join(d, "o1"), num_resamples=50, num_thresholds=40, verbose=False, truncate_steps=[K])
+        short = hc.run(d, 2, os.path.join(d, "o2"), num_resamples=50, num_thresholds=40, verbose=False)
+        assert os.path.exists(os.path.join(d, "o1", f"curve_all_q_head_first{K}.csv"))
+
+        r_full, r_short = full["results"]["all"], short["results"]["all"]
+        assert r_full["num_steps"] == S and len(r_full["fixed_step_accuracy"]) == S
+        r_trunc = r_full["truncated"][str(K)]
+        assert r_trunc["num_steps"] == K
+        for key in ["full_step_accuracy", "fixed_step_accuracy", "oracle", "flips", "unchanged_among_unsolved"]:
+            assert r_trunc[key] == r_short[key], key
+        assert r_trunc["fixed_step_accuracy"] == r_full["fixed_step_accuracy"][:K]
+        for head in ["q_head", "probe"]:
+            assert r_trunc["heads"][head]["t0"] == r_short["heads"][head]["t0"]
+            for a, b in zip(r_trunc["heads"][head]["operating_points"], r_short["heads"][head]["operating_points"]):
+                assert a["selection"] == b["selection"]
+                assert a["report"]["accuracy"] == b["report"]["accuracy"] and a["report"]["avg_steps"] == b["report"]["avg_steps"]
+        try:
+            hc.run(d, 2, os.path.join(d, "o3"), verbose=False, truncate_steps=[K])
+            raise AssertionError("expected an error")
+        except ValueError:
+            pass
+
+
+def test_old_capture_without_change_records():
+    rng = np.random.default_rng(6)
+    P, S = 100, 4
+    logits = rng.normal(size=(P, S)).astype(np.float32)
+    with tempfile.TemporaryDirectory() as d:
+        _write_rank(os.path.join(d, "step_1_eval_steps.0"), logits, logits, rng.random((P, S)) < 0.5,
+                    np.arange(P), np.zeros(P), ["all"])
+        r = hc.run(d, 1, os.path.join(d, "o"), num_resamples=0, verbose=False)["results"]["all"]
+        assert isinstance(r["unchanged_among_unsolved"], str)
+
+
+def _write_rank(path, logits_q, logits_aux, correct, example_index, set_id, set_names, preds_changed=None):
     P, S = correct.shape
+    extra = {} if preds_changed is None else {"preds_changed": torch.from_numpy(preds_changed)}
     torch.save({
+        **extra,
         "q_halt_logits": torch.from_numpy(logits_q),
         "aux_halt_logits/probe": torch.from_numpy(logits_aux),
         "seq_is_correct": torch.from_numpy(correct),

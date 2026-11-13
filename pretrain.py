@@ -1,6 +1,7 @@
 from typing import Optional, Any, Sequence, List
 from dataclasses import dataclass
 import os
+import re
 import math
 import yaml
 import shutil
@@ -23,7 +24,7 @@ from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMeta
 from utils.functions import load_model_class, get_model_source_path
 from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
 from models.ema import EMAHelper
-from models.losses import compute_correctness, AUX_HALT_LOGITS_KEY
+from utils.eval_halting import run_eval_batch
 
 
 class LossConfig(pydantic.BaseModel):
@@ -91,6 +92,16 @@ class PretrainConfig(pydantic.BaseModel):
     # Per-step capture during evaluation: halt logits (original + auxiliary heads) and per-puzzle
     # correctness at every ACT step, saved to checkpoint_path/step_<N>_eval_steps.<rank>
     eval_capture_steps: bool = False
+    # Step limit in evaluation only (None: the model's halt_max_steps). Training is unaffected.
+    eval_halt_max_steps: Optional[int] = None
+    # Halting in evaluation: a puzzle halts at the first step where the halt logit of eval_halt_head
+    # ("q_head" or an auxiliary head name) is >= eval_halt_threshold, or at the step limit. Its
+    # outputs and step count are frozen there; metrics and evaluators use the frozen outputs.
+    eval_halt_enable: bool = False
+    eval_halt_threshold: float = 0.0
+    eval_halt_head: str = "q_head"
+    # Only evaluate load_checkpoint (no training). The step is read from the file name (step_<N>).
+    eval_only: bool = False
 
     ema: bool = False # use Exponential-Moving-Average
     ema_rate: float = 0.999 # EMA-rate
@@ -135,6 +146,8 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
         num_puzzle_identifiers=train_metadata.num_puzzle_identifiers,
         causal=False  # Non-autoregressive
     )
+    if config.eval_halt_max_steps is not None:
+        model_cfg["eval_halt_max_steps"] = config.eval_halt_max_steps
 
     # Instantiate model with loss head
     model_cls = load_model_class(config.arch.name)
@@ -264,6 +277,16 @@ def load_checkpoint(model: nn.Module, config: PretrainConfig):
         # Auxiliary halting heads: checkpoints may lack them (keep the fresh init) or contain heads
         # that are not configured (drop them). All other keys are still loaded strictly.
         model_state = model.state_dict()
+
+        # torch.compile prefixes every key with "_orig_mod."; accept checkpoints saved either way
+        prefix = "_orig_mod."
+        model_prefixed = all(k.startswith(prefix) for k in model_state)
+        ckpt_prefixed = all(k.startswith(prefix) for k in state_dict)
+        if model_prefixed and not ckpt_prefixed:
+            state_dict = {prefix + k: v for k, v in state_dict.items()}
+        elif ckpt_prefixed and not model_prefixed:
+            state_dict = {k[len(prefix):]: v for k, v in state_dict.items()}
+
         is_aux_key = lambda k: ".aux_halt_heads." in f".{k}"
         missing_aux = [k for k in model_state if is_aux_key(k) and k not in state_dict]
         unexpected_aux = [k for k in state_dict if is_aux_key(k) and k not in model_state]
@@ -277,7 +300,7 @@ def load_checkpoint(model: nn.Module, config: PretrainConfig):
             print(f"Ignoring auxiliary halt head weights not used by this model: {unexpected_aux}")
 
         # Resize and reset puzzle emb if needed
-        puzzle_emb_name = "_orig_mod.model.inner.puzzle_emb.weights"
+        puzzle_emb_name = (prefix if model_prefixed else "") + "model.inner.puzzle_emb.weights"
         expected_shape: torch.Size = model.model.puzzle_emb.weights.shape  # type: ignore
         if puzzle_emb_name in state_dict:
             puzzle_emb = state_dict[puzzle_emb_name]
@@ -390,8 +413,8 @@ def evaluate(
 
         # Optional per-step capture (compact: halt logits + correctness per puzzle and step)
         capture_steps = config.eval_capture_steps
+        halt_head = config.eval_halt_head if config.eval_halt_enable else None
         if capture_steps:
-            return_keys.update({"preds", "q_halt_logits", AUX_HALT_LOGITS_KEY})
             local_batch_size = eval_loader.dataset.local_batch_size  # type: ignore
             set_next_start = {}  # set name -> global start index of its next batch (mirrors PuzzleDataset._iter_test)
             captured = {}  # quantity -> list of per-batch CPU tensors
@@ -417,24 +440,15 @@ def evaluate(
             with torch.device("cuda"):
                 carry = train_state.model.initial_carry(batch)  # type: ignore
 
-            # Forward
-            inference_steps = 0
-            step_records = {}  # quantity -> list over steps of [B] tensors (on device)
-            while True:
-                carry, loss, metrics, preds, all_finish = train_state.model(
-                    carry=carry, batch=batch, return_keys=return_keys
-                )
-                inference_steps += 1
-
-                if capture_steps:
-                    step_records.setdefault("q_halt_logits", []).append(preds["q_halt_logits"])
-                    for k, v in preds.items():
-                        if k.startswith(AUX_HALT_LOGITS_KEY + "/"):
-                            step_records.setdefault(k, []).append(v)
-                    step_records.setdefault("seq_is_correct", []).append(compute_correctness(preds["preds"], batch["labels"])[3])
-
-                if all_finish:
-                    break
+            # Forward (to the step limit; with halting, outputs are frozen per puzzle at its halting step)
+            result = run_eval_batch(
+                train_state.model, carry, batch, return_keys,
+                capture_steps=capture_steps,
+                halt_head=halt_head, halt_threshold=config.eval_halt_threshold,
+                expected_steps=config.eval_halt_max_steps,
+            )
+            metrics, preds, inference_steps = result["metrics"], result["preds"], result["inference_steps"]
+            step_records = result.get("step_records", {})
 
             if capture_steps:
                 # Global example indices of this rank's rows; padding rows are dropped
@@ -449,6 +463,8 @@ def evaluate(
                 captured.setdefault("example_index", []).append(torch.arange(local_start, local_start + num_valid, dtype=torch.int64))
                 captured.setdefault("set_id", []).append(torch.full((num_valid, ), set_ids[set_name], dtype=torch.int32))
                 captured.setdefault("num_steps", []).append(torch.full((num_valid, ), inference_steps, dtype=torch.int32))
+                if "halt_step" in result:
+                    captured.setdefault("halt_step", []).append(result["halt_step"][:num_valid].cpu())
                 del step_records
 
             if rank == 0:
@@ -463,7 +479,7 @@ def evaluate(
             for evaluator in evaluators:
                 evaluator.update_batch(batch, preds)
 
-            del carry, loss, preds, batch, all_finish
+            del carry, preds, batch, result
 
             # Aggregate metrics
             set_id = set_ids[set_name]
@@ -514,6 +530,9 @@ def evaluate(
 
             step_capture = {k: _cat(k, v) for k, v in captured.items()}
             step_capture["set_names"] = list(set_ids.keys())
+            if halt_head is not None:
+                step_capture["eval_halt_head"] = halt_head
+                step_capture["eval_halt_threshold"] = float(config.eval_halt_threshold)
 
             os.makedirs(config.checkpoint_path, exist_ok=True)
             torch.save(step_capture, os.path.join(config.checkpoint_path, f"step_{train_state.step}_eval_steps.{rank}"))
@@ -596,6 +615,35 @@ def save_code_and_config(config: PretrainConfig):
     wandb.run.log_code(config.checkpoint_path)
 
 
+def check_eval_only_config(config: PretrainConfig):
+    """Evaluation-only runs: refuse setups that would silently evaluate something else."""
+    if config.load_checkpoint is None:
+        raise ValueError("eval_only=True needs load_checkpoint=<path to a step_<N> file>")
+
+    ckpt_dir = os.path.dirname(os.path.abspath(config.load_checkpoint))
+    if config.checkpoint_path is not None and os.path.abspath(config.checkpoint_path) == ckpt_dir:
+        raise ValueError(f"eval_only would write into the checkpoint's own directory ({ckpt_dir}) and overwrite "
+                         "its config and capture files. Use a different run_name or checkpoint_path.")
+
+    # Same architecture as the run that produced the checkpoint (e.g. a different H_cycles would
+    # load without error and give different results)
+    saved_config_file = os.path.join(ckpt_dir, "all_config.yaml")
+    if os.path.exists(saved_config_file):
+        with open(saved_config_file, "rt") as f:
+            saved_arch = yaml.safe_load(f).get("arch", {})
+        arch = config.arch.model_dump()
+        diff = {k: (saved_arch.get(k), arch.get(k)) for k in sorted(set(saved_arch) | set(arch)) if saved_arch.get(k) != arch.get(k)}
+        if diff:
+            raise ValueError(f"arch settings differ from {saved_config_file} (saved, now): {diff}")
+    else:
+        print(f"WARNING: no all_config.yaml next to {config.load_checkpoint}; cannot check the arch settings")
+
+
+def checkpoint_step(path: str) -> int:
+    m = re.fullmatch(r"step_(\d+)", os.path.basename(path))
+    return int(m.group(1)) if m else 0
+
+
 def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int) -> PretrainConfig:
     objects = [None]
     if rank == 0:
@@ -608,6 +656,9 @@ def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int) -> 
             config.run_name = f"{config.arch.name.split('@')[-1]} {coolname.generate_slug(2)}"
         if config.checkpoint_path is None:
             config.checkpoint_path = os.path.join("checkpoints", config.project_name, config.run_name)
+
+        if config.eval_only:
+            check_eval_only_config(config)
 
         objects = [config]
 
@@ -675,7 +726,26 @@ def launch(hydra_config: DictConfig):
         wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump(), settings=wandb.Settings(x_disable_stats=True))  # type: ignore
         wandb.log({"num_params": sum(x.numel() for x in train_state.model.parameters())}, step=0)
         save_code_and_config(config)
-    if config.ema:
+    if config.eval_only:
+        ############ Evaluation only
+        # Checkpoints hold the weights used by the in-training evaluation (the EMA weights when
+        # ema=True), so they are evaluated as loaded.
+        train_state.step = checkpoint_step(config.load_checkpoint)  # type: ignore
+        train_state.model.eval()
+        metrics = evaluate(config, train_state, eval_loader, eval_metadata, evaluators,
+                           rank=RANK, world_size=WORLD_SIZE, cpu_group=CPU_PROCESS_GROUP)
+        if RANK == 0 and metrics is not None:
+            print(f"EVAL RESULTS (step {train_state.step})")
+            for set_name, set_metrics in metrics.items():
+                if isinstance(set_metrics, dict):
+                    for k, v in sorted(set_metrics.items()):
+                        print(f"    {set_name}/{k:40s} {v}")
+                else:
+                    print(f"    {set_name:40s} {set_metrics}")
+            wandb.log(metrics, step=train_state.step)
+        total_iters = 0  # skip training
+
+    if config.ema and not config.eval_only:
         print('Setup EMA')
         ema_helper = EMAHelper(mu=config.ema_rate)
         ema_helper.register(train_state.model)

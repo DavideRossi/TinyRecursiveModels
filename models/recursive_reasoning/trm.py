@@ -63,6 +63,9 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     puzzle_emb_len: int = 16 # if non-zero, its specified to this value
     no_ACT_continue: bool =  True # No continue ACT loss, only use the sigmoid of the halt which makes much more sense
 
+    # Step limit used in evaluation only (None: halt_max_steps). Training always uses halt_max_steps.
+    eval_halt_max_steps: Optional[int] = None
+
     # Auxiliary halting heads: trained on detached state, never used for halting (see models/aux_halt_heads.py)
     aux_halt_heads: List[AuxHaltHeadConfig] = []
 
@@ -291,7 +294,10 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
         with torch.no_grad():
             # Step
             new_steps = new_steps + 1
-            is_last_step = new_steps >= self.config.halt_max_steps
+            max_steps = self.config.halt_max_steps
+            if not self.training and self.config.eval_halt_max_steps is not None:
+                max_steps = self.config.eval_halt_max_steps
+            is_last_step = new_steps >= max_steps
             
             halted = is_last_step
 

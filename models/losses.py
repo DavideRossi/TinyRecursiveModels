@@ -138,3 +138,35 @@ class ACTLossHead(nn.Module):
 
         return new_carry, total_loss, metrics, detached_outputs, new_carry.halted.all()
 
+
+
+def act_eval_metrics(loss_fn, logits: torch.Tensor, preds: torch.Tensor, q_halt_logits: torch.Tensor,
+                     aux_halt_logits: Dict[str, torch.Tensor], labels: torch.Tensor,
+                     steps: torch.Tensor, max_steps: int) -> Dict[str, torch.Tensor]:
+    """Evaluation metrics from per-puzzle outputs taken at each puzzle's own halting step.
+
+    Same definitions (and sums, to be divided by "count") as ACTLossHead reports when all
+    puzzles halt at the last step, plus "halted_early": puzzles that halted before `max_steps`.
+    """
+    with torch.no_grad():
+        mask, loss_counts, is_correct, seq_is_correct = compute_correctness(preds, labels)
+        loss_divisor = loss_counts.clamp_min(1).unsqueeze(-1)
+        valid_metrics = loss_counts > 0
+
+        metrics = {
+            "count": valid_metrics.sum(),
+
+            "accuracy":       torch.where(valid_metrics, (is_correct.to(torch.float32) / loss_divisor).sum(-1), 0).sum(),
+            "exact_accuracy": (valid_metrics & seq_is_correct).sum(),
+
+            "q_halt_accuracy": (valid_metrics & ((q_halt_logits >= 0) == seq_is_correct)).sum(),
+            "steps":          torch.where(valid_metrics, steps, 0).sum(),
+            "halted_early":   (valid_metrics & (steps < max_steps)).sum(),
+
+            "lm_loss": (loss_fn(logits, labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask) / loss_divisor).sum(),
+            "q_halt_loss": F.binary_cross_entropy_with_logits(q_halt_logits, seq_is_correct.to(q_halt_logits.dtype), reduction="sum"),
+        }
+        for name, aux_logit in aux_halt_logits.items():
+            metrics[f"aux_{name}_q_halt_accuracy"] = (valid_metrics & ((aux_logit >= 0) == seq_is_correct)).sum()
+            metrics[f"aux_{name}_q_halt_loss"] = F.binary_cross_entropy_with_logits(aux_logit, seq_is_correct.to(aux_logit.dtype), reduction="sum")
+    return metrics

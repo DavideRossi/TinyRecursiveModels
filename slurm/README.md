@@ -11,6 +11,7 @@ partition names and paths.
 | `build_image.sbatch` | Builds `trm.sif` on the `sbuild` partition. |
 | `build_dataset.sbatch` | Downloads Sudoku-Extreme from HuggingFace and builds `data/sudoku-extreme-1k-aug-1000`. |
 | `train_sudoku.sbatch` | Trains on one L40S (`l40s` partition). |
+| `eval_sudoku.sbatch` | Evaluates an existing checkpoint, without training. |
 | `read_wandb_offline.py` | Prints eval metrics from an offline wandb run. |
 | `logs/` | Slurm output of all jobs (`<job-name>_<job-id>.out`). |
 
@@ -256,6 +257,38 @@ SIF=/scratch.hpc/$USER/trm-<branch>.sif RUN_NAME=sudoku_aux_linear \
 
 The first run of a branch that changes model code is a good time for one of the
 quick checks of section 4.
+
+## 8. Evaluate an existing checkpoint
+
+`eval_sudoku.sbatch` runs only the evaluation of a saved checkpoint, with any
+evaluation settings. Checkpoints hold the weights the in-training evaluation
+used (the EMA weights), so the same settings reproduce the logged metrics.
+
+```bash
+CKPT=checkpoints/Sudoku-extreme-1k-aug-1000-ACT-torch/<run>/step_<N> RUN_NAME=<new name> \
+  sbatch slurm/eval_sudoku.sbatch [overrides]
+```
+
+- `RUN_NAME` must differ from the training run's name. Results go to
+  `checkpoints/<project>/<RUN_NAME>/`, with the checkpoint's step number in the
+  file names.
+- Repeat every `arch.*` override of the training run (for example
+  `'arch.aux_halt_heads=[{type:detached_linear}]'`). The job stops if the
+  settings differ from the `all_config.yaml` next to the checkpoint.
+- The metrics are printed at the end of the job log (`EVAL RESULTS`) and logged
+  to wandb.
+- One pass over the test set takes about 1 h per 16 steps.
+
+| Override | Effect |
+|---|---|
+| `eval_halt_max_steps=32` | Step limit in evaluation (default: the training limit, `arch.halt_max_steps`). |
+| `eval_halt_enable=True` | Each puzzle halts at the first step where its halt logit is ≥ the threshold, or at the step limit. Metrics use its outputs at that step; `steps` is the mean halting step and `halted_early` the fraction that halted before the limit. |
+| `eval_halt_threshold=0` | The threshold (default 0). |
+| `eval_halt_head=q_head` | The head that decides: `q_head` or an auxiliary head name. |
+| `eval_capture_steps=True` | Save the per-step capture (`step_<N>_eval_steps.<rank>`). It always holds every step up to the limit, whatever the halting settings. |
+
+These options also work in a training run, where they apply to its
+evaluations.
 
 ## Troubleshooting
 

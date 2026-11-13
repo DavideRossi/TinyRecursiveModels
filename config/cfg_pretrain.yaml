@@ -22,6 +22,13 @@ eval_interval: 10000
 checkpoint_every_eval: True
 eval_capture_steps: False # per-step halt logits + correctness during eval (saved as step_<N>_eval_steps.<rank>)
 
+# Evaluation options (see PretrainConfig in pretrain.py)
+eval_halt_max_steps: null   # step limit in evaluation only (null: arch.halt_max_steps)
+eval_halt_enable: False     # halt each puzzle when its halt logit >= eval_halt_threshold
+eval_halt_threshold: 0
+eval_halt_head: q_head      # or an auxiliary head name
+eval_only: False            # only evaluate load_checkpoint
+
 lr: 1e-4
 lr_min_ratio: 1.0
 lr_warmup_steps: 2000
