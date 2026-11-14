@@ -22,6 +22,8 @@ matplotlib.use("Agg")
 from analysis import eval_steps as es  # noqa: E402
 from analysis import report  # noqa: E402
 from test_eval_steps import _write_rank  # noqa: E402
+from test_restarts import write_known_run  # noqa: E402
+from experiments import restarts as rs  # noqa: E402
 
 NOTEBOOK = os.path.join(ROOT, "analysis", "report.ipynb")
 REAL_OUTPUT = os.path.join(ROOT, "checkpoints", "sudoku_aux_linear_eval32", "analysis")
@@ -207,6 +209,47 @@ def test_views_skip_what_a_run_lacks():
         assert out.count("[old] skipped") == 1 and len(fig.axes[2].lines) == 1
 
 
+def make_restarts(d, with_reference=True):
+    """summary.json of a hand-made restarts run (see test_restarts.write_known_run)."""
+    os.makedirs(d, exist_ok=True)
+    write_known_run(d)
+    s = rs.summarize(d, num_resamples=50, verbose=False)
+    if with_reference:  # plain reference points, as summarize writes them with --reference
+        s["reference"] = {"plain_continuation": [
+            {"budget": 15, "overall": {"accuracy": 0.5, "avg_steps": 9.6}},
+            {"budget": 20, "overall": {"accuracy": 0.625, "avg_steps": 11.0}}],
+            "fixed_steps": [{"steps": 10, "accuracy": 0.375}, {"steps": 20, "accuracy": 0.625}]}
+        with open(os.path.join(d, "summary.json"), "w") as f:
+            json.dump(s, f)
+    return d
+
+
+def test_restart_views():
+    with tempfile.TemporaryDirectory() as d:
+        summary = report.load_restarts(make_restarts(os.path.join(d, "r")))
+        table = report.restarts_table(summary)
+        assert len(table.rows) == 2 and table.rows[0][0] == "control (continue)"
+        assert table.rows[1][2] == "0.4000 [0.4000, 0.4000]" and table.rows[1][9] == "0.6000"  # any seed: 3 of 5
+        paired = report.restarts_paired_table(summary)
+        assert [r[0] for r in paired.rows] == ["perturb 0.1, seed 0", "perturb 0.1, seed 1", "perturb 0.1, sequential"]
+        assert paired.rows[0][1:5] == ["1", "1", "1", "2"]
+        fig = report.plot_restarts_solved(summary)
+        assert len(fig.axes) == 2
+        fig, out = captured(report.plot_restarts_overall, summary)
+        assert out == "" and len(fig.axes[0].lines) >= 1 + 2  # plain curve and the fixed-step lines
+
+        no_ref = report.load_restarts(make_restarts(os.path.join(d, "r2"), with_reference=False))
+        fig, out = captured(report.plot_restarts_overall, no_ref)
+        assert "no plain reference" in out and fig is not None
+        for view in (report.restarts_table, report.restarts_paired_table, report.plot_restarts_solved,
+                     report.plot_restarts_overall):
+            assert view(None) is None
+        result, out = captured(report.load_restarts, None)
+        assert result is None and "skipped" in out
+        result, out = captured(report.load_restarts, os.path.join(d, "missing"))
+        assert result is None and "not found" in out
+
+
 def _execute_notebook(runs_source):
     import nbformat
     from nbclient import NotebookClient
@@ -251,9 +294,10 @@ def test_notebook_runs_on_synthetic_output():
     with tempfile.TemporaryDirectory() as d:
         new = make_analysis(d, "new", 8, 4)
         old = make_analysis(d, "old", 6, 5, new_capture=False)
+        restarts = make_restarts(os.path.join(d, "restarts"))
         source = (f"RUNS = {{'half': ({new!r}, 4), 'full': {new!r}, 'old': {old!r}}}\n"
-                  "HEADS = ['q_head', 'probe']\nSET_NAME = 'all'\nLOG_HISTOGRAMS = False")
-        notes = _check_executed(_execute_notebook(source), (9, 9), (5, 5))
+                  f"HEADS = ['q_head', 'probe']\nSET_NAME = 'all'\nLOG_HISTOGRAMS = False\nRESTARTS_DIR = {restarts!r}")
+        notes = _check_executed(_execute_notebook(source), (11, 11), (7, 7))
         assert "[old] skipped" in notes and "[full]" not in notes
 
 
@@ -265,8 +309,9 @@ def test_notebook_runs_on_the_32_step_analysis():
     if not os.path.exists(os.path.join(REAL_OUTPUT, "summary.json")):
         print(f"  (skipped: {os.path.relpath(REAL_OUTPUT, ROOT)} not present)")
         return
-    # 4 figures and 3 tables from a capture without grid hashes and cell counts; 9 and 5 with them
-    _check_executed(_execute_notebook(None), (4, 9), (3, 5))
+    # 4 figures and 3 tables from a capture without grid hashes and cell counts; 9 and 5 with them;
+    # 2 more of each with RESTARTS_DIR
+    _check_executed(_execute_notebook(None), (4, 11), (3, 7))
 
 
 if __name__ == "__main__":

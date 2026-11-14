@@ -48,6 +48,15 @@ class Run:
     def num_steps(self) -> int:
         return self.result["num_steps"]
 
+    @property
+    def step_offset(self) -> int:
+        """Captures of later steps only (e.g. a restart branch) start at step_offset + 1."""
+        return self.result.get("step_offset", 0)
+
+    def steps(self, n: int) -> np.ndarray:
+        """Step numbers of n per-step values starting at the first captured step."""
+        return np.arange(1, n + 1) + self.step_offset
+
     def heads(self, wanted: Sequence[str]) -> List[str]:
         """The wanted heads this run has; prints a note for the others."""
         for h in wanted:
@@ -302,7 +311,7 @@ def plot_accuracy_by_step(runs: List[Run]):
         _legend(ax_rate, _run_handles([run for run in runs if run in with_rate]), loc="upper right")
     for run in _back_to_front(runs):
         acc = np.array(run.result["fixed_step_accuracy"])
-        steps = np.arange(1, len(acc) + 1)
+        steps = run.steps(len(acc))
         ax_acc.plot(steps, acc, "-o", color=run.color, linewidth=2, markersize=3.5)
         unsolved = 1 - acc
         ax_unsolved.plot(steps[unsolved > 0], unsolved[unsolved > 0], "-o", color=run.color, linewidth=2, markersize=3.5)
@@ -347,7 +356,11 @@ def plot_operational_curves(runs: List[Run], heads: Sequence[str] = ("q_head",))
     fig, (ax, ax_zoom) = plt.subplots(1, 2, figsize=(13, 5))
     _draw_operational(ax, runs, heads, notes=True)
     _draw_operational(ax_zoom, runs, heads, notes=False)
-    _style(ax, "average steps", "accuracy (all cells correct)", "Accuracy against average steps (report split)")
+    xlabel = "average steps"
+    if any(run.step_offset for run in runs):
+        xlabel += " (counted from the first captured step: " + ", ".join(
+            f"{run.label} from step {run.step_offset + 1}" for run in runs) + ")"
+    _style(ax, xlabel, "accuracy (all cells correct)", "Accuracy against average steps (report split)")
     _style(ax_zoom, "average steps", "accuracy (all cells correct)", "Zoom on the corner")
 
     # Corner: from the oracle / t = 0 points to a little beyond the selected operating points
@@ -468,7 +481,7 @@ def plot_halting_steps(runs: List[Run], heads: Sequence[str] = ("q_head",), log_
     for axrow, (run, head, points) in zip(axes, rows):
         for ax, op in zip(axrow, points):
             counts = np.array(op["report"]["halt_step_counts"])
-            steps = np.arange(1, len(counts) + 1)
+            steps = run.steps(len(counts))
             ax.bar(steps[:-1], counts[:-1], width=0.8, color=run.color)
             ax.bar(steps[-1:], counts[-1:], width=0.8, color=run.color, alpha=0.45, hatch="///", edgecolor=run.color)
             _style(ax, "halting step", "puzzles" + (" (log scale)" if log_y else ""),
@@ -556,7 +569,7 @@ def plot_cycle_histograms(runs: List[Run], log_y: bool = False):
         periods = {int(k): v for k, v in cycles["confirmed"]["period_counts"].items()}
         ax_period.bar(list(periods), list(periods.values()), width=0.8, color=run.color)
         starts = np.array(cycles["confirmed"]["start_step_counts"])
-        ax_start.bar(np.arange(1, len(starts) + 1), starts, width=0.8, color=run.color)
+        ax_start.bar(run.steps(len(starts)), starts, width=0.8, color=run.color)
         total = sum(periods.values())
         ylabel = "puzzles" + (" (log scale)" if log_y else "")
         _style(ax_period, "period (steps)", ylabel,
@@ -686,5 +699,180 @@ def plot_solving_rate_by_distance(runs: List[Run], log_y: bool = True):
     if log_y:
         _plain_log(ax)
     _legend(ax, _run_handles([run for run, _ in shown]), loc="upper right")
+    fig.tight_layout()
+    return fig
+
+
+# --------------------------------------------------------------------------- restarts (experiments/restarts.py)
+
+
+VARIANT_COLORS = {"continue": MUTED, "perturb": "#2a78d6", "noisy_restart": "#eb6834"}
+PLAIN_COLOR = INK
+
+
+def load_restarts(directory: Optional[str], root: str = ".") -> Optional[dict]:
+    """summary.json of an experiments/restarts.py run, or None (with a note)."""
+    if directory is None:
+        print("[restarts] skipped: RESTARTS_DIR is not set")
+        return None
+    path = os.path.join(root, directory, "summary.json")
+    if not os.path.exists(path):
+        print(f"[restarts] skipped: {path} not found (run experiments/restarts.py, or its summarize command)")
+        return None
+    with open(path) as f:
+        summary = json.load(f)
+    if not summary["split"]["retried_report_puzzles"]:
+        print("[restarts] skipped: no puzzle was retried")
+        return None
+    return summary
+
+
+def _label(variant: str, scale) -> str:
+    return "control (continue)" if variant == "continue" else f"{variant.replace('_', ' ')} {scale:g}"
+
+
+def _rng_text(stat: dict, digits: int = 4, signed: bool = False) -> str:
+    f = f"{{:{'+' if signed else ''}.{digits}f}}"
+    return f"{f.format(stat['mean'])} [{f.format(stat['min'])}, {f.format(stat['max'])}]"
+
+
+def restarts_table(summary: Optional[dict]) -> Optional[Table]:
+    """Per variant and scale, over the retried puzzles: results across seeds, the sequential
+    (deployable) strategy, and the any-seed oracle."""
+    if summary is None:
+        return None
+    ctrl = next(b for b in summary["branches"] if b["variant"] == "continue")
+    rows = [[_label("continue", 0), "-", f"{ctrl['solved_share']:.4f}", "-", f"{ctrl['false_acceptances']:,}",
+             f"{ctrl['mean_steps']:.2f}", "-", "-", "-", "-", f"{ctrl['overall']['accuracy']:.4f} @ {ctrl['overall']['avg_steps']:.2f}"]]
+    for g in summary["groups"]:
+        a, s = g["across_seeds"], g["sequential"]
+        realized = [b["realized_scale_z_H"] for b in summary["branches"] if (b["variant"], b["scale"]) == (g["variant"], g["scale"])]
+        plain = s.get("paired_with_plain_same_budget")
+        rows.append([_label(g["variant"], g["scale"]), f"{np.mean(realized):.4g}", _rng_text(a["solved_share"]),
+                     _rng_text(g["difference_from_control"], signed=True), _rng_text(a["false_acceptances"], 0),
+                     _rng_text(a["mean_steps"], 2), f"{s['solved_share']:.4f} ({s['false_acceptances']:,} false)",
+                     f"{s['mean_steps']:.2f}",
+                     "-" if plain is None else f"{plain['difference']:+.4f} [{plain['difference_ci'][0]:+.4f}, {plain['difference_ci'][1]:+.4f}]"
+                     if "difference_ci" in plain else f"{plain['difference']:+.4f}",
+                     f"{g['any_seed_oracle']['solved_share']:.4f}",
+                     f"{s['overall']['accuracy']:.4f} @ {s['overall']['avg_steps']:.2f}"])
+    n, sp = summary["split"]["retried_report_puzzles"], summary["settings"]
+    return Table(["variant", "realized noise (z_H)", "solved share: mean [min, max] over seeds", "vs control",
+                  "false acceptances", "mean steps", "sequential: solved", "sequential: mean steps",
+                  "sequential vs plain, same budget", "any seed (oracle)", "overall: accuracy @ avg steps"], rows,
+                 f"{n:,} retried puzzles of the report split (not accepted by {sp['head']} at threshold {sp['threshold']:g} "
+                 f"by step {sp['n1']}); each attempt has {sp['n2']} more steps. Sequential: seeds in order, first accepted "
+                 "answer kept, every attempt's steps counted (deployable). Any seed (oracle): picks the seed with ground "
+                 "truth, several times the budget; an upper bound only. Overall: phase 1 plus phase 2, all report puzzles "
+                 "(sequential overall uses the sequential strategy).")
+
+
+def restarts_paired_table(summary: Optional[dict]) -> Optional[Table]:
+    """Paired comparison with the control on the same retried puzzles, per seed and for the sequential strategy."""
+    if summary is None:
+        return None
+    rows = []
+
+    def add(name, p):
+        ci = p.get("difference_ci")
+        rows.append([name, f"{p['both']:,}", f"{p['variant_only']:,}", f"{p['control_only']:,}", f"{p['neither']:,}",
+                     f"{p['difference']:+.4f}" + (f" [{ci[0]:+.4f}, {ci[1]:+.4f}]" if ci else "")])
+
+    for b in summary["branches"]:
+        if b["variant"] != "continue":
+            add(f"{_label(b['variant'], b['scale'])}, seed {b['seed']}", b["paired_with_control"])
+    for g in summary["groups"]:
+        add(f"{_label(g['variant'], g['scale'])}, sequential", g["sequential"]["paired_with_control"])
+    return Table(["variant", "solved by both", "variant only", "control only", "neither", "difference [95% interval]"],
+                 rows, "Retried puzzles of the report split. Interval: bootstrap over puzzles. Many puzzles changing "
+                       "sides with a difference near 0 means the noise re-rolls which puzzles are solved, not how many.")
+
+
+def plot_restarts_solved(summary: Optional[dict]):
+    """Share of retried puzzles solved, and false acceptances, per variant and scale."""
+    if summary is None:
+        return None
+    from matplotlib.lines import Line2D
+    plt = _plt()
+    n = summary["split"]["retried_report_puzzles"]
+    ctrl = next(b for b in summary["branches"] if b["variant"] == "continue")
+    groups = summary["groups"]
+    fig, (ax, ax_false) = plt.subplots(1, 2, figsize=(14, 4.8))
+    labels = [_label("continue", 0)] + [_label(g["variant"], g["scale"]) for g in groups]
+    for axis, key, scale in ((ax, "solved", 1 / n), (ax_false, "false_acceptances", 1 / n)):
+        axis.scatter([0], [ctrl[key] * scale], s=60, color=VARIANT_COLORS["continue"], zorder=3)
+        axis.axhline(ctrl[key] * scale, color=VARIANT_COLORS["continue"], linestyle="--", linewidth=1)
+        for x, g in enumerate(groups, start=1):
+            color = VARIANT_COLORS.get(g["variant"], MUTED)
+            seeds = [b for b in summary["branches"] if (b["variant"], b["scale"]) == (g["variant"], g["scale"])]
+            ys = [b[key] * scale for b in seeds]
+            axis.scatter([x - 0.12] * len(ys), ys, s=22, color=color, alpha=0.8, zorder=3)
+            axis.plot([x - 0.22, x - 0.02], [np.mean(ys)] * 2, color=color, linewidth=2.5)
+            axis.scatter([x + 0.15], [g["sequential"][key] * scale], s=70, facecolor="white", edgecolor=color,
+                         linewidth=1.8, marker="D", zorder=4)
+            if key == "solved":
+                axis.scatter([x + 0.15], [g["any_seed_oracle"]["solved_share"]], s=45, color=MUTED, marker="x", zorder=4)
+        axis.set_xticks(range(len(labels)), labels, rotation=30, ha="right")
+        axis.set_xlim(-0.6, len(labels) - 0.4)
+        axis.grid(axis="x", visible=False)
+    _style(ax, "", "share of the retried puzzles solved", f"Retried puzzles solved ({n:,} puzzles, report split)")
+    _style(ax_false, "", "share of the retried puzzles", "False acceptances (accepted but wrong)")
+    handles = [Line2D([], [], color=MUTED, marker="o", linestyle="none", markersize=5, label="one seed"),
+               Line2D([], [], color=MUTED, linewidth=2.5, label="mean over seeds"),
+               Line2D([], [], color=MUTED, marker="D", markerfacecolor="white", linestyle="none", markersize=7,
+                      label="sequential (deployable, several attempts)"),
+               Line2D([], [], color=MUTED, marker="x", linestyle="none", markersize=7, label="any seed (oracle, upper bound)"),
+               Line2D([], [], color=MUTED, linestyle="--", label="control")]
+    _legend(ax, handles, loc="best")
+    fig.tight_layout()
+    return fig
+
+
+def plot_restarts_overall(summary: Optional[dict]):
+    """Whole procedure (phase 1 + phase 2) on the report split: accuracy against average steps, with
+    plain continuation to the same budgets and fixed step counts as references."""
+    if summary is None:
+        return None
+    from matplotlib.lines import Line2D
+    plt = _plt()
+    fig, ax = plt.subplots(figsize=(10, 5.6))
+    p1 = summary["phase1"]["overall_stop_at_n1"]
+    ax.scatter([p1["avg_steps"]], [p1["accuracy"]], marker="s", s=60, color=MUTED, zorder=4)
+    ax.annotate(f"stop at step {summary['settings']['n1']}", (p1["avg_steps"], p1["accuracy"]), textcoords="offset points",
+                xytext=(6, -12), fontsize=8, color=INK)
+    for b in summary["branches"]:
+        color = VARIANT_COLORS.get(b["variant"], MUTED)
+        ax.scatter([b["overall"]["avg_steps"]], [b["overall"]["accuracy"]], s=60 if b["variant"] == "continue" else 18,
+                   color=color, alpha=1 if b["variant"] == "continue" else 0.7, zorder=3)
+    for g in summary["groups"]:
+        s = g["sequential"]["overall"]
+        color = VARIANT_COLORS.get(g["variant"], MUTED)
+        ax.scatter([s["avg_steps"]], [s["accuracy"]], marker="D", s=70, facecolor="white", edgecolor=color, linewidth=1.8, zorder=5)
+        ax.annotate(f"{g['scale']:g}", (s["avg_steps"], s["accuracy"]), textcoords="offset points", xytext=(6, 2),
+                    fontsize=8, color=INK)
+    ref = summary.get("reference")
+    if ref:
+        plain = ref["plain_continuation"]
+        xs, ys = [p["overall"]["avg_steps"] for p in plain], [p["overall"]["accuracy"] for p in plain]
+        ax.plot(xs, ys, "-o", color=PLAIN_COLOR, linewidth=1.5, markersize=6, zorder=4)
+        for p in plain:
+            ax.annotate(f"plain, halting within {p['budget']}", (p["overall"]["avg_steps"], p["overall"]["accuracy"]),
+                        textcoords="offset points", xytext=(6, -12), fontsize=8, color=INK)
+        for f in ref["fixed_steps"]:
+            ax.axhline(f["accuracy"], color=PLAIN_COLOR, linestyle=":", linewidth=1)
+            ax.annotate(f"{f['steps']} steps, no halting: {f['accuracy']:.4f}", (0.0, f["accuracy"]), xycoords=("axes fraction", "data"),
+                        textcoords="offset points", xytext=(4, 3), ha="left", fontsize=8, color=MUTED)
+    else:
+        print("[restarts] no plain reference points: summarize with --reference DIR STEP (a plain capture)")
+    _style(ax, "average steps per puzzle", "accuracy (all cells correct)",
+           f"Whole procedure on the report split ({summary['split']['report_puzzles']:,} puzzles)")
+    handles = [Line2D([], [], color=VARIANT_COLORS[v], marker="o", linestyle="none", markersize=6, label=_label(v, 0).split(" 0")[0])
+               for v in ("continue", "perturb", "noisy_restart")]
+    handles += [Line2D([], [], color=MUTED, marker="D", markerfacecolor="white", linestyle="none", markersize=7,
+                       label="sequential (label: noise scale)"),
+                Line2D([], [], color=MUTED, marker="s", linestyle="none", markersize=6, label="phase 1 only")]
+    if ref:
+        handles.append(Line2D([], [], color=PLAIN_COLOR, marker="o", label="plain continuation, same budgets"))
+    _legend(ax, handles, loc="lower right")
     fig.tight_layout()
     return fig

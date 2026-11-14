@@ -538,6 +538,47 @@ def test_end_to_end_with_hashes_and_compact_dtypes():
         assert len(old["results"]["all"]["solving_rate"]) == S
 
 
+def test_subset_capture_with_step_offset():
+    """A capture of some puzzles and of steps 5-8 only: steps are numbered from 5, and each puzzle is
+    in the same split as in the analysis of the full capture."""
+    rng = np.random.default_rng(10)
+    P, S, offset = 500, 8, 4
+    logits = rng.normal(size=(P, S)).cumsum(axis=1).astype(np.float32)
+    correct = np.logical_or.accumulate(rng.random((P, S)) < 0.2, axis=1)
+    subset = np.sort(rng.choice(P, size=120, replace=False))
+    with tempfile.TemporaryDirectory() as d:
+        full_dir, sub_dir = os.path.join(d, "full"), os.path.join(d, "sub")
+        os.makedirs(full_dir), os.makedirs(sub_dir)
+        _write_rank(os.path.join(full_dir, "step_1_eval_steps.0"), logits, logits, correct, np.arange(P),
+                    np.zeros(P, dtype=np.int64), ["all"])
+        path = os.path.join(sub_dir, "step_1_eval_steps.0")
+        _write_rank(path, logits[subset, offset:], logits[subset, offset:], correct[subset, offset:], subset,
+                    np.zeros(len(subset), dtype=np.int64), ["all"])
+        capture = torch.load(path, weights_only=True)
+        capture.update(step_offset=offset, set_sizes=[P], puzzle_subset="test subset")
+        torch.save(capture, path)
+
+        full = es.run(full_dir, 1, os.path.join(d, "out_full"), num_resamples=0, num_thresholds=10, verbose=False)
+        sub = es.run(sub_dir, 1, os.path.join(d, "out_sub"), num_resamples=0, num_thresholds=10, verbose=False)
+        assert sub["checks"]["step_offset"] == offset and sub["checks"]["per_set"]["all"]["missing"] == P - len(subset)
+
+        # Same split for the subset's puzzles as in the full analysis
+        report_full = ~es.split_puzzles(P, 0.2, 0)
+        assert sub["results"]["all"]["num_report"] == report_full[subset].sum()
+        assert np.array_equal(es.split_subset(np.zeros(P), np.arange(P), [P], 0.2, 0), ~report_full)
+        r = sub["results"]["all"]
+        assert np.isclose(r["full_step_accuracy"], correct[subset][report_full[subset], -1].mean())
+        assert np.allclose(r["fixed_step_accuracy"], correct[subset][report_full[subset], offset:].mean(axis=0))
+        assert full["results"]["all"]["step_offset"] == 0 and r["step_offset"] == offset
+        # Per-step entries are numbered from offset + 1
+        assert [e["step"] for e in r["solving_rate"][1:]] == list(range(offset + 2, S + 1))
+        assert r["solving_rate"][0] is None
+
+        # Two sets: positions follow the set sizes
+        split = es.split_subset(np.array([1, 0]), np.array([0, 3]), [5, 7], 0.2, 0)
+        assert np.array_equal(split, es.split_puzzles(12, 0.2, 0)[[5, 3]])
+
+
 def test_end_to_end_outputs():
     rng = np.random.default_rng(4)
     P, S = 1000, 6

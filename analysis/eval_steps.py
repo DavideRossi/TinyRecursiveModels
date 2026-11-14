@@ -18,6 +18,14 @@ pretrain.evaluate. Each is a torch.save dict with
     wrong_cells                             int     [P, S]   labelled cells predicted wrong (0 <=> seq_is_correct)
     cells_changed                           int     [P, S]   cells whose prediction changed from the previous step
     halt_step, eval_halt_head, eval_halt_threshold           in-loop halting, if it was enabled
+  and, in captures of a subset of the steps or of the puzzles (experiments/restarts.py),
+    step_offset                             int      the captured steps are step_offset + 1, ..., step_offset + S
+    set_sizes, puzzle_subset                         puzzles per set in the full test set; what the subset is
+
+With step_offset, every per-step result is numbered from step_offset + 1, while average steps
+and halting steps count the captured steps only (1 = the first captured step). With set_sizes,
+the selection / report split is that of the full test set, so a subset is split as its
+puzzles are in the analysis of a full capture.
 
 The capture always holds every step up to the evaluation step limit S (any value), whatever
 halting was applied in the loop. --truncate-steps K repeats the analysis on the first K steps:
@@ -72,7 +80,10 @@ Q_HEAD = "q_head"
 PER_PUZZLE_KEYS = ("puzzle_identifiers", "example_index", "set_id", "num_steps")
 OPTIONAL_KEYS = ("preds_changed", "z_H_rel_change", "z_L_rel_change", "pred_hash", "wrong_cells", "cells_changed",
                  "halt_step")  # newer captures
-HALT_META_KEYS = ("eval_halt_head", "eval_halt_threshold")
+META_KEYS = ("eval_halt_head", "eval_halt_threshold",  # in-loop halting, if it was enabled
+             "step_offset",   # the capture starts after this many steps (e.g. a branch of experiments/restarts.py)
+             "set_sizes",     # puzzles per set in the full test set, for captures of a subset of the puzzles
+             "puzzle_subset")  # description of the subset
 
 
 # --------------------------------------------------------------------------- loading
@@ -102,7 +113,7 @@ def read_capture_file(path: str) -> dict:
             out["logits"][k[len(AUX_PREFIX):]] = v.numpy()
         elif k in PER_PUZZLE_KEYS or k in OPTIONAL_KEYS or k == "seq_is_correct":
             out[k] = v.numpy()
-        elif k in HALT_META_KEYS:
+        elif k in META_KEYS:
             out[k] = v
     return out
 
@@ -117,8 +128,8 @@ def merge_captures(parts: List[dict], files: List[str]) -> dict:
             raise ValueError(f"{path}: heads {list(part['logits'])} differ from {list(first['logits'])}")
         if part["seq_is_correct"].shape[1] != first["seq_is_correct"].shape[1]:
             raise ValueError(f"{path}: number of steps differs between files")
-        for k in OPTIONAL_KEYS + HALT_META_KEYS:
-            if (k in part) != (k in first) or (k in HALT_META_KEYS and part.get(k) != first.get(k)):
+        for k in OPTIONAL_KEYS + META_KEYS:
+            if (k in part) != (k in first) or (k in META_KEYS and part.get(k) != first.get(k)):
                 raise ValueError(f"{path}: '{k}' differs between files")
 
     data = {
@@ -129,7 +140,7 @@ def merge_captures(parts: List[dict], files: List[str]) -> dict:
     for k in PER_PUZZLE_KEYS + OPTIONAL_KEYS:
         if k in first:
             data[k] = np.concatenate([p[k] for p in parts])
-    for k in HALT_META_KEYS:
+    for k in META_KEYS:
         if k in first:
             data[k] = first[k]
     return data
@@ -164,7 +175,7 @@ def deduplicate(data: dict) -> (dict, dict):
     for k in PER_PUZZLE_KEYS + OPTIONAL_KEYS:
         if k in data:
             out[k] = data[k][first]
-    for k in HALT_META_KEYS:
+    for k in META_KEYS:
         if k in data:
             out[k] = data[k]
     report = {
@@ -178,11 +189,15 @@ def deduplicate(data: dict) -> (dict, dict):
 
 
 def check_missing(data: dict, data_dir: Optional[str]) -> dict:
-    """Per set: expected count (from the dataset if given, else max index + 1) vs present."""
+    """Per set: expected count (from the dataset if given, else max index + 1) vs present.
+
+    For a capture of a subset of the puzzles (set_sizes), missing puzzles are expected."""
     report = {}
     for sid, name in enumerate(data["set_names"]):
         idx = data["example_index"][data["set_id"] == sid]
         expected, source = (int(idx.max()) + 1 if len(idx) else 0), "max example_index + 1"
+        if "set_sizes" in data:
+            expected, source = int(data["set_sizes"][sid]), "set_sizes in the capture (subset of the puzzles)"
         if data_dir is not None:
             path = os.path.join(data_dir, "test", f"{name}__inputs.npy")
             expected, source = int(np.load(path, mmap_mode="r").shape[0]), path
@@ -211,6 +226,7 @@ def load(ckpt_dir: str, step: int, data_dir: Optional[str] = None) -> (dict, dic
             raise ValueError(f"NaN halt logits for head {head}")
 
     checks = {"files": files, "num_steps": num_steps, "heads": list(data["logits"]),
+              **{k: data[k] for k in ("step_offset", "set_sizes", "puzzle_subset") if k in data},
               "set_names": data["set_names"], **dup_report, "per_set": check_missing(data, data_dir)}
     if "wrong_cells" in data:
         mismatches = int(((data["wrong_cells"] == 0) != data["seq_is_correct"]).sum())
@@ -613,6 +629,28 @@ def split_puzzles(num_puzzles: int, selection_frac: float, seed: int) -> np.ndar
     return np.random.default_rng(seed).random(num_puzzles) < selection_frac
 
 
+def split_subset(set_id: np.ndarray, example_index: np.ndarray, set_sizes: List[int], selection_frac: float,
+                 seed: int) -> np.ndarray:
+    """The split of a subset of the puzzles: each puzzle gets the value it has in the split of the
+    full test set (split_puzzles over all puzzles, sorted by set and example index)."""
+    offsets = np.concatenate([[0], np.cumsum(set_sizes)])
+    full = split_puzzles(int(offsets[-1]), selection_frac, seed)
+    return full[offsets[np.asarray(set_id, dtype=np.int64)] + np.asarray(example_index, dtype=np.int64)]
+
+
+def shift_steps(obj, offset: int):
+    """Add offset to every "step" entry of the nested per-step results (in place)."""
+    if isinstance(obj, dict):
+        if isinstance(obj.get("step"), int):
+            obj["step"] += offset
+        for v in obj.values():
+            shift_steps(v, offset)
+    elif isinstance(obj, list):
+        for v in obj:
+            shift_steps(v, offset)
+    return obj
+
+
 def analyze_group(data: dict, rows: np.ndarray, selection: np.ndarray, tolerances: List[float],
                   num_resamples: int, num_thresholds: int, rng: np.random.Generator,
                   truncate: Optional[int] = None) -> (dict, dict):
@@ -684,6 +722,10 @@ def analyze_group(data: dict, rows: np.ndarray, selection: np.ndarray, tolerance
                 "report": evaluate_with_ci(logits[rep], c_rep, chosen["threshold"], num_resamples, rng),
             })
         result["heads"][head] = head_result
+    offset = int(data.get("step_offset", 0))
+    if offset:
+        shift_steps(result, offset)
+    result["step_offset"] = offset
     return result, curves
 
 
@@ -763,7 +805,10 @@ def run(ckpt_dir: str, step: int, out_dir: str, selection_frac: float = 0.2,
     for k in truncate_steps:
         if not 1 <= k < checks["num_steps"]:
             raise ValueError(f"--truncate-steps {k}: must be between 1 and {checks['num_steps'] - 1} (the capture has {checks['num_steps']} steps)")
-    selection = split_puzzles(len(data["set_id"]), selection_frac, seed)
+    if "set_sizes" in data:
+        selection = split_subset(data["set_id"], data["example_index"], data["set_sizes"], selection_frac, seed)
+    else:
+        selection = split_puzzles(len(data["set_id"]), selection_frac, seed)
     rng = np.random.default_rng(seed + 1)
 
     groups = {name: data["set_id"] == sid for sid, name in enumerate(data["set_names"])
@@ -812,11 +857,16 @@ def print_summary(summary: dict, plots: List[str], out_dir: str):
     c = summary["checks"]
     print(f"Loaded {len(c['files'])} file(s): {c['rows_loaded']} rows, {c['unique_puzzles']} unique puzzles, "
           f"{c['num_steps']} steps, heads {c['heads']}")
+    if c.get("step_offset"):
+        print(f"  Steps {c['step_offset'] + 1} to {c['step_offset'] + c['num_steps']} (average and halting steps count "
+              f"from step {c['step_offset'] + 1})")
+    if "puzzle_subset" in c:
+        print(f"  Subset of the puzzles: {c['puzzle_subset']}")
     if c["duplicate_rows_dropped"]:
         print(f"  WARNING: dropped {c['duplicate_rows_dropped']} duplicate rows "
               f"({c['duplicates_with_differing_values']} puzzles with differing values)")
     for name, s in c["per_set"].items():
-        if s["missing"] or s["out_of_range"]:
+        if (s["missing"] and "set_sizes" not in c) or s["out_of_range"]:
             print(f"  WARNING: set {name}: {s['missing']} missing, {s['out_of_range']} out of range "
                   f"(expected {s['expected']} from {s['expected_source']})")
     il = c.get("in_loop_halting")

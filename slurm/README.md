@@ -12,6 +12,7 @@ partition names and paths.
 | `build_dataset.sbatch` | Downloads Sudoku-Extreme from HuggingFace and builds `data/sudoku-extreme-1k-aug-1000`. |
 | `train_sudoku.sbatch` | Trains on one L40S (`l40s` partition). |
 | `eval_sudoku.sbatch` | Evaluates an existing checkpoint, without training. |
+| `restarts_sudoku.sbatch` | Perturbed-restart experiment on an existing checkpoint (`experiments/restarts.py`). |
 | `read_wandb_offline.py` | Prints eval metrics from an offline wandb run. |
 | `logs/` | Slurm output of all jobs (`<job-name>_<job-id>.out`). |
 
@@ -289,6 +290,33 @@ CKPT=checkpoints/Sudoku-extreme-1k-aug-1000-ACT-torch/<run>/step_<N> RUN_NAME=<n
 
 These options also work in a training run, where they apply to its
 evaluations.
+
+## 9. Perturbed restarts
+
+`restarts_sudoku.sbatch` runs `experiments/restarts.py`: every test puzzle runs
+N1 steps with halting by a head; the puzzles the head has not accepted get N2
+more steps, continuing (the control), continuing from a perturbed state, or
+restarting from a noisy initial state, for several noise scales and seeds. The
+script's docstring describes the procedure and outputs.
+
+```bash
+CKPT=checkpoints/Sudoku-extreme-1k-aug-1000-ACT-torch/<run>/step_<N> \
+OUT=checkpoints/Sudoku-extreme-1k-aug-1000-ACT-torch/<run>_restarts SIF=/scratch.hpc/$USER/trm-modern.sif \
+  sbatch slurm/restarts_sudoku.sbatch [options]
+```
+
+| Option | Effect |
+|---|---|
+| `--max-puzzles 5000` | Only the first 5000 test puzzles (quick trials). |
+| `--n1 32 --n2 32` | Phase-1 steps and extra steps per attempt (defaults). |
+| `--head q_head --threshold 5.27` | The halting rule, in both phases (defaults). |
+| `--perturb-scales ... --restart-scales ... --seeds ...` | Noise scales of each variant and seeds (defaults 0.001 0.1 0.3 1.0; 0.1 0.3 1.0; 0 1 2). |
+| `--reference DIR STEP` | A plain capture of the same checkpoint with at least N1 + N2 steps. The summary checks phase 1 and the control against it and adds plain continuation to the same budgets. |
+
+The summary can be recomputed anywhere (no GPU), e.g. on a laptop after
+copying the output directory (about 0.7 GB, most of it the per-branch captures
+under `captures/`; the summary needs only `captures/continue/`):
+`python experiments/restarts.py summarize OUT --reference DIR STEP`.
 
 ## Troubleshooting
 

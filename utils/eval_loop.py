@@ -99,6 +99,72 @@ def relative_change(new: torch.Tensor, old: torch.Tensor) -> torch.Tensor:
     return torch.linalg.vector_norm(new - old, dim=1) / torch.linalg.vector_norm(old, dim=1)
 
 
+def halt_logit(preds: Dict[str, torch.Tensor], head: str) -> torch.Tensor:
+    """The halt logit of `head` from the model outputs, with a clear error for unknown heads."""
+    key = halt_logit_key(head)
+    if key not in preds:
+        available = [Q_HEAD] + [k[len(AUX_HALT_LOGITS_KEY) + 1:] for k in preds if k.startswith(AUX_HALT_LOGITS_KEY + "/")]
+        raise ValueError(f"eval_halt_head='{head}' is not a halting head of this model. Available: {available}")
+    return preds[key]
+
+
+CAPTURE_RETURN_KEYS = {"preds", "q_halt_logits", AUX_HALT_LOGITS_KEY}
+
+
+class StepRecorder:
+    """Per-step capture records of one batch: call `record` after every model step, in order.
+
+    step_records maps each quantity to a list over steps of [B] tensors. Compact dtypes: bool
+    flags, float16 relative state changes, int64 grid hashes (pred_hash), float32 halt logits,
+    cell counts (wrong_cells, cells_changed) in the smallest integer dtype for the sequence length.
+
+    Changes are relative to the previous recorded step. To continue a run that was not recorded
+    (e.g. from a branch point), pass the predictions and the carry of the step before the first
+    recorded one as prev_preds / prev_carry; otherwise the first step has no change (False / 0 / NaN).
+    """
+
+    def __init__(self, prev_preds: Optional[torch.Tensor] = None, prev_carry: Any = None):
+        self.step_records: Dict[str, List[torch.Tensor]] = {}
+        self.prev_preds = prev_preds
+        inner = getattr(prev_carry, "inner_carry", None)
+        self.prev_z = {name: getattr(inner, name) for name in ("z_H", "z_L") if getattr(inner, name, None) is not None}
+
+    def _add(self, key: str, value: torch.Tensor):
+        self.step_records.setdefault(key, []).append(value)
+
+    def record(self, preds: Dict[str, torch.Tensor], carry: Any, labels: torch.Tensor):
+        self._add("q_halt_logits", preds["q_halt_logits"])
+        for k, v in preds.items():
+            if k.startswith(AUX_HALT_LOGITS_KEY + "/"):
+                self._add(k, v)
+        _, loss_counts, is_correct, seq_is_correct = compute_correctness(preds["preds"], labels)
+        self._add("seq_is_correct", seq_is_correct)
+        # Same mask and definition as seq_is_correct: 0 wrong cells <=> seq_is_correct
+        count_dtype = cell_count_dtype(preds["preds"].flatten(1).shape[1])
+        self._add("wrong_cells", (loss_counts - is_correct.sum(-1)).to(count_dtype))
+
+        if self.prev_preds is None:
+            cells_changed = torch.zeros(preds["preds"].shape[0], dtype=count_dtype, device=preds["preds"].device)
+        else:
+            cells_changed = (preds["preds"] != self.prev_preds).flatten(1).sum(dim=1).to(count_dtype)
+        self._add("cells_changed", cells_changed)
+        self._add("preds_changed", cells_changed > 0)
+        self.prev_preds = preds["preds"]
+        self._add("pred_hash", grid_hash(preds["preds"]))
+
+        inner_carry = getattr(carry, "inner_carry", None)
+        for name in ("z_H", "z_L"):
+            z = getattr(inner_carry, name, None)
+            if z is None:
+                continue
+            if name in self.prev_z:
+                change = relative_change(z, self.prev_z[name])
+            else:
+                change = torch.full((z.shape[0], ), float("nan"), dtype=torch.float32, device=z.device)
+            self._add(f"{name}_rel_change", change.to(torch.float16))
+            self.prev_z[name] = z
+
+
 def run_eval_batch(
     model: Any,
     carry: Any,
@@ -117,65 +183,28 @@ def run_eval_batch(
 
     Returns a dict with: metrics, preds (the reported outputs), inference_steps, and
     - step_records (if capture_steps): quantity -> list over steps of [B] tensors with the RAW
-      values of every step, whatever the halting settings. Compact dtypes: bool flags, float16
-      relative state changes, int64 grid hashes (pred_hash), float32 halt logits, cell counts
-      (wrong_cells, cells_changed) in the smallest integer dtype for the sequence length;
+      values of every step, whatever the halting settings (see StepRecorder);
     - halt_step (if halting): [B] int32.
     """
     return_keys = set(return_keys)
     if capture_steps:
-        return_keys.update({"preds", "q_halt_logits", AUX_HALT_LOGITS_KEY})
+        return_keys.update(CAPTURE_RETURN_KEYS)
     frozen = None
     if halt_head is not None:
         return_keys.update({"logits", "preds", "q_halt_logits", AUX_HALT_LOGITS_KEY})
         frozen = FrozenOutputs(halt_threshold)
 
     inference_steps = 0
-    step_records: Dict[str, List[torch.Tensor]] = {}
-    prev_preds, prev_z = None, {}
+    recorder = StepRecorder() if capture_steps else None
     while True:
         carry, loss, metrics, preds, all_finish = model(carry=carry, batch=batch, return_keys=return_keys)
         inference_steps += 1
 
-        if capture_steps:
-            step_records.setdefault("q_halt_logits", []).append(preds["q_halt_logits"])
-            for k, v in preds.items():
-                if k.startswith(AUX_HALT_LOGITS_KEY + "/"):
-                    step_records.setdefault(k, []).append(v)
-            _, loss_counts, is_correct, seq_is_correct = compute_correctness(preds["preds"], batch["labels"])
-            step_records.setdefault("seq_is_correct", []).append(seq_is_correct)
-            # Same mask and definition as seq_is_correct: 0 wrong cells <=> seq_is_correct
-            count_dtype = cell_count_dtype(preds["preds"].flatten(1).shape[1])
-            step_records.setdefault("wrong_cells", []).append((loss_counts - is_correct.sum(-1)).to(count_dtype))
-
-            # Changes with respect to the previous step (step 1 has none: False / 0 / NaN)
-            if prev_preds is None:
-                cells_changed = torch.zeros(preds["preds"].shape[0], dtype=count_dtype, device=preds["preds"].device)
-            else:
-                cells_changed = (preds["preds"] != prev_preds).flatten(1).sum(dim=1).to(count_dtype)
-            step_records.setdefault("cells_changed", []).append(cells_changed)
-            step_records.setdefault("preds_changed", []).append(cells_changed > 0)
-            prev_preds = preds["preds"]
-            step_records.setdefault("pred_hash", []).append(grid_hash(preds["preds"]))
-
-            inner_carry = getattr(carry, "inner_carry", None)
-            for name in ("z_H", "z_L"):
-                z = getattr(inner_carry, name, None)
-                if z is None:
-                    continue
-                if name in prev_z:
-                    change = relative_change(z, prev_z[name])
-                else:
-                    change = torch.full((z.shape[0], ), float("nan"), dtype=torch.float32, device=z.device)
-                step_records.setdefault(f"{name}_rel_change", []).append(change.to(torch.float16))
-                prev_z[name] = z
+        if recorder is not None:
+            recorder.record(preds, carry, batch["labels"])
 
         if frozen is not None:
-            key = halt_logit_key(halt_head)  # type: ignore
-            if key not in preds:
-                available = [Q_HEAD] + [k[len(AUX_HALT_LOGITS_KEY) + 1:] for k in preds if k.startswith(AUX_HALT_LOGITS_KEY + "/")]
-                raise ValueError(f"eval_halt_head='{halt_head}' is not a halting head of this model. Available: {available}")
-            frozen.update(inference_steps, preds[key], preds, is_last=bool(all_finish))
+            frozen.update(inference_steps, halt_logit(preds, halt_head), preds, is_last=bool(all_finish))
 
         if all_finish:
             break
@@ -185,8 +214,8 @@ def run_eval_batch(
                            "this model does not support eval_halt_max_steps")
 
     result: Dict[str, Any] = {"metrics": metrics, "preds": preds, "inference_steps": inference_steps}
-    if capture_steps:
-        result["step_records"] = step_records
+    if recorder is not None:
+        result["step_records"] = recorder.step_records
     if frozen is not None:
         out = frozen.outputs
         result["preds"] = out
