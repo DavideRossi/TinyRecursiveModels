@@ -217,8 +217,14 @@ def run_batch(model: Any, batch: Dict[str, torch.Tensor], set_id: np.ndarray, ex
     return_keys = set(CAPTURE_RETURN_KEYS)
     threshold = settings.threshold
 
+    # On the model's device, as pretrain.evaluate does (the test loader yields CPU tensors, and the
+    # initial carry must be created on the same device as the model's buffers)
+    device = next(model.parameters()).device
+    batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+
     # Phase 1
-    carry = model.initial_carry(batch)
+    with torch.device(device):
+        carry = model.initial_carry(batch)
     frozen = FrozenOutputs(threshold)
     for step in range(1, n1 + 1):
         carry, _, _, preds, all_finish = model(carry=carry, batch=batch, return_keys=return_keys)
