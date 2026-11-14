@@ -191,13 +191,15 @@ def test_old_capture_without_change_records():
 
 
 def _write_rank(path, logits_q, logits_aux, correct, example_index, set_id, set_names, preds_changed=None,
-                rel_change=None, pred_hash=None):
+                rel_change=None, pred_hash=None, cells=None):
     P, S = correct.shape
     extra = {} if preds_changed is None else {"preds_changed": torch.from_numpy(preds_changed)}
     if rel_change is not None:
         extra.update({f"{z}_rel_change": torch.from_numpy(v) for z, v in rel_change.items()})
     if pred_hash is not None:
         extra["pred_hash"] = torch.from_numpy(pred_hash)
+    if cells is not None:  # {"wrong_cells": ..., "cells_changed": ...}
+        extra.update({k: torch.from_numpy(v) for k, v in cells.items()})
     torch.save({
         **extra,
         "q_halt_logits": torch.from_numpy(logits_q),
@@ -283,6 +285,114 @@ def test_halt_step_counts():
     assert rep["halt_step_counts"] == [1, 2, 2]
     assert np.isclose(rep["avg_steps"], np.dot(rep["halt_step_counts"], [1, 2, 3]) / len(logits))
     assert np.isclose(rep["frac_halted_early"], 1 - rep["halt_step_counts"][-1] / len(logits))
+
+
+# Wrong cells (S = 4); 0 wrong cells <=> correct
+_WRONG = np.array([[5, 3, 1, 0],     # solved at step 4
+                   [9, 9, 2, 2],     # unsolved, minimum 2
+                   [0, 0, 0, 0],     # always correct
+                   [1, 0, 4, 3],     # solved at step 2, lost: minimum 0
+                   [12, 12, 10, 9],  # far away
+                   [2, 1, 1, 1]], dtype=np.uint8)
+
+
+def test_wrong_cells_statistics():
+    correct = _WRONG == 0
+    by_step = es.wrong_cells_among_unsolved(correct, _WRONG)
+    # step 1, unsolved rows 0, 1, 3, 4, 5 -> 5, 9, 1, 12, 2
+    s1 = by_step[0]
+    assert (s1["step"], s1["unsolved"], s1["median"], s1["q25"], s1["q75"]) == (1, 5, 5.0, 2.0, 9.0)
+    assert s1["share_at_most"] == {"1": 0.2, "2": 0.4, "4": 0.4, "8": 0.6}
+    # step 4, unsolved rows 1, 3, 4, 5 -> 2, 3, 9, 1
+    s4 = by_step[3]
+    assert (s4["unsolved"], s4["median"]) == (4, 2.5)
+    assert s4["share_at_most"] == {"1": 0.25, "2": 0.5, "4": 0.75, "8": 0.75}
+    assert es.wrong_cells_among_unsolved(np.ones((2, 2), dtype=bool), np.zeros((2, 2), dtype=np.uint8))[0]["median"] is None
+
+    end = es.wrong_cells_unsolved_at_last(correct, _WRONG)
+    # unsolved at the last step: rows 1, 3, 4, 5 -> last 2, 3, 9, 1; minimum 2, 0, 9, 1
+    assert end["num_unsolved_at_last"] == 4
+    assert end["last_step_counts"] == [0, 1, 1, 1, 0, 0, 0, 0, 0, 1]
+    assert end["minimum_counts"] == [1, 1, 1, 0, 0, 0, 0, 0, 0, 1]
+    assert (end["last_step_median"], end["minimum_median"]) == (2.5, 1.5)
+
+
+def test_solving_rate_by_distance():
+    correct = _WRONG == 0
+    out = {b["bucket"]: b for b in es.solving_rate_by_distance(correct, _WRONG)}
+    assert list(out) == ["1", "2", "3-4", "5-8", "9+"]
+    # Pairs (puzzle, s - 1 -> s) with the puzzle wrong at s - 1, by its wrong cells at s - 1:
+    #   row 0: 5 -> 3 (5-8), 3 -> 1 (3-4), 1 -> 0 solved (1)
+    #   row 1: 9 -> 9, 9 -> 2 (9+, 9+), 2 -> 2 (2)
+    #   row 3: 1 -> 0 solved (1); 4 -> 3 (3-4)        (step 2 -> 3 starts from a correct grid)
+    #   row 4: 12 -> 12, 12 -> 10, 10 -> 9 (9+ x3)
+    #   row 5: 2 -> 1 (2), 1 -> 1, 1 -> 1 (1, 1)
+    expect = {"1": (4, 3, 2), "2": (2, 2, 0), "3-4": (2, 2, 0), "5-8": (1, 1, 0), "9+": (5, 2, 0)}
+    for k, (n, puzzles, solved) in expect.items():
+        assert (out[k]["observations"], out[k]["puzzles"], out[k]["solved"]) == (n, puzzles, solved), k
+    assert out["1"]["rate"] == 0.5 and out["5-8"]["rate"] == 0.0
+    lo, hi = out["1"]["rate_ci_approx"]
+    assert lo < 0.5 < hi
+    assert sum(b["observations"] for b in out.values()) == int((~correct[:, :-1]).sum())
+    # Custom buckets; an empty bucket has no rate
+    custom = es.solving_rate_by_distance(correct, _WRONG, buckets=((1, 2), (50, None)))
+    assert (custom[0]["bucket"], custom[0]["observations"]) == ("1-2", 6)
+    assert (custom[1]["bucket"], custom[1]["observations"], custom[1]["rate"]) == ("50+", 0, None)
+
+
+def test_cells_changed_and_solved_state_change():
+    correct = _WRONG == 0
+    changed = np.array([[0, 2, 2, 1],
+                        [0, 0, 7, 0],
+                        [0, 0, 0, 0],
+                        [0, 1, 4, 1],
+                        [0, 3, 2, 1],
+                        [0, 1, 0, 0]], dtype=np.uint8)
+    out = es.cells_changed_among_unsolved(correct, changed)
+    assert out[0] is None
+    # step 2: wrong at step 1 = rows 0, 1, 3, 4, 5 -> 2, 0, 1, 3, 1
+    assert (out[1]["unsolved_at_previous_step"], out[1]["median"], out[1]["q25"], out[1]["q75"]) == (5, 1.0, 1.0, 2.0)
+    assert np.isclose(out[1]["mean"], 7 / 5)
+    # step 3: wrong at step 2 = rows 0, 1, 4, 5 -> 2, 7, 2, 0
+    assert (out[2]["unsolved_at_previous_step"], out[2]["median"]) == (4, 2.0)
+
+    rel = np.arange(24, dtype=np.float32).reshape(6, 4)
+    rel[:, 0] = np.nan
+    solved = es.state_change_among_unsolved(correct, rel, solved=True)
+    # correct at step 1: row 2 -> value at step 2 = 9; correct at step 2: rows 2, 3 -> 10, 14
+    assert (solved[1]["solved_at_previous_step"], solved[1]["median"]) == (1, 9.0)
+    assert (solved[2]["solved_at_previous_step"], solved[2]["median"]) == (2, 12.0)
+    unsolved = es.state_change_among_unsolved(correct, rel)
+    assert unsolved[1]["unsolved_at_previous_step"] + solved[1]["solved_at_previous_step"] == 6
+
+
+def test_load_checks_wrong_cells_against_correctness():
+    rng = np.random.default_rng(9)
+    P, S = 50, 5
+    logits = rng.normal(size=(P, S)).astype(np.float32)
+    wrong = rng.integers(0, 4, size=(P, S)).astype(np.uint8)
+    changed = rng.integers(0, 3, size=(P, S)).astype(np.uint8)
+    args = (logits, logits, wrong == 0, np.arange(P), np.zeros(P, dtype=np.int64), ["all"])
+    with tempfile.TemporaryDirectory() as d:
+        _write_rank(os.path.join(d, "step_1_eval_steps.0"), *args, cells={"wrong_cells": wrong, "cells_changed": changed})
+        data, checks = es.load(d, 1)
+        assert checks["wrong_cells_match_correctness"] and data["wrong_cells"].dtype == np.uint8
+        r = es.run(d, 1, os.path.join(d, "out"), num_resamples=0, num_thresholds=10, verbose=False, truncate_steps=[3])
+        res = r["results"]["all"]
+        assert len(res["wrong_cells"]["among_unsolved"]) == S and len(res["cells_changed_among_unsolved"]) == S
+        assert len(res["truncated"]["3"]["wrong_cells"]["among_unsolved"]) == 3
+        assert "not available" in res["state_change_among_solved"]["z_H"]
+        json.dumps(es._json_safe(r))
+
+        bad = wrong.copy()
+        bad[3, 2] = 0 if bad[3, 2] else 1  # disagrees with the correctness flag
+        _write_rank(os.path.join(d, "step_2_eval_steps.0"), *args, cells={"wrong_cells": bad, "cells_changed": changed})
+        try:
+            es.load(d, 2)
+        except ValueError as e:
+            assert "1 (puzzle, step)" in str(e)
+        else:
+            raise AssertionError("expected ValueError")
 
 
 def test_solving_rate():
@@ -423,6 +533,8 @@ def test_end_to_end_with_hashes_and_compact_dtypes():
 
         old = es.run(d, 2, os.path.join(d, "out2"), num_resamples=0, num_thresholds=20, verbose=False)
         assert "not available" in old["results"]["all"]["cycles"]
+        assert "not available" in old["results"]["all"]["wrong_cells"]
+        assert "not available" in old["results"]["all"]["cells_changed_among_unsolved"]
         assert len(old["results"]["all"]["solving_rate"]) == S
 
 

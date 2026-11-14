@@ -383,40 +383,69 @@ def plot_operational_curves(runs: List[Run], heads: Sequence[str] = ("q_head",))
     return fig
 
 
+def _quartile_band(ax, entries: List[dict], color: str, solid: bool = True, positive: bool = False):
+    """Median line with a quartile band; positive=True drops non-positive values (log axes)."""
+    keep = [e for e in entries if e.get("median") is not None and (not positive or e["median"] > 0)]
+    if not keep:
+        return False
+    steps = [e["step"] for e in keep]
+    lo = [e["q25"] if not positive or e["q25"] > 0 else e["median"] for e in keep]
+    ax.fill_between(steps, lo, [e["q75"] for e in keep], color=color, alpha=0.18 if solid else 0.08, linewidth=0)
+    ax.plot(steps, [e["median"] for e in keep], "-o" if solid else "--", color=color, linewidth=2 if solid else 1.6,
+            markersize=3.5)
+    return True
+
+
 def plot_stuck_vs_moving(runs: List[Run]):
-    """Among puzzles unsolved at the previous step: share with an unchanged grid, and state change."""
+    """Among puzzles unsolved at the previous step: share with an unchanged grid, cells changed, and
+    the relative state change, the latter next to the same quantity for puzzles already solved."""
+    from matplotlib.lines import Line2D
     plt = _plt()
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4.2))
-    drawn = [[], [], []]
+    fig, axes = plt.subplots(2, 2, figsize=(13, 8.4))
+    (ax_same, ax_cells), (ax_zh, ax_zl) = axes
+    drawn = {ax: [] for ax in axes.ravel()}
     for run in _back_to_front(runs):
         entries = _per_step(run.result.get("unchanged_among_unsolved"))
         entries = [e for e in entries or [] if e.get("share") is not None]
         if entries:
-            axes[0].plot([e["step"] for e in entries], [e["share"] for e in entries], "-o", color=run.color,
+            ax_same.plot([e["step"] for e in entries], [e["share"] for e in entries], "-o", color=run.color,
                          linewidth=2, markersize=3.5)
-            drawn[0].append(run)
+            drawn[ax_same].append(run)
         else:
             note(run, "the analysis has no record of grid changes (older capture)")
-        for ax, lst, z in zip(axes[1:], drawn[1:], ("z_H", "z_L")):
-            entries = _per_step(run.result.get("state_change_among_unsolved", {}).get(z))
-            entries = [e for e in entries or [] if e.get("median") is not None]
-            if entries:
-                steps = [e["step"] for e in entries]
-                ax.fill_between(steps, [e["q25"] for e in entries], [e["q75"] for e in entries], color=run.color,
-                                alpha=0.18, linewidth=0)
-                ax.plot(steps, [e["median"] for e in entries], "-o", color=run.color, linewidth=2, markersize=3.5)
-                lst.append(run)
-            else:
+
+        entries = _per_step(run.result.get("cells_changed_among_unsolved"))
+        if entries is None:
+            note(run, "the analysis has no count of changed cells (older capture, or rerun eval_steps.py)")
+        elif _quartile_band(ax_cells, entries, run.color):
+            drawn[ax_cells].append(run)
+
+        for ax, z in ((ax_zh, "z_H"), (ax_zl, "z_L")):
+            unsolved = _per_step(run.result.get("state_change_among_unsolved", {}).get(z))
+            if unsolved is None:
                 note(run, f"the analysis has no relative change of {z} (older capture, or rerun eval_steps.py)")
-    _style(axes[0], "step", "share with the same grid as the previous step",
-           "Unsolved puzzles whose grid did not change")
-    for ax, z in zip(axes[1:], ("z_H", "z_L")):
+                continue
+            if _quartile_band(ax, unsolved, run.color, positive=True):
+                drawn[ax].append(run)
+            solved = _per_step(run.result.get("state_change_among_solved", {}).get(z))
+            if solved is None:
+                note(run, f"the analysis has no relative change of {z} for solved puzzles (rerun eval_steps.py)")
+            else:
+                _quartile_band(ax, solved, run.color, solid=False, positive=True)
+
+    _style(ax_same, "step", "share with the same grid as the previous step", "Grid did not change")
+    _style(ax_cells, "step", "cells changed from the previous step", "Cells changed: median and quartiles")
+    for ax, z in ((ax_zh, "z_H"), (ax_zl, "z_L")):
         _style(ax, "step", f"relative change of {z} (log scale)", f"Relative change of {z}: median and quartiles")
         if ax.lines:
             _plain_log(ax)
-    for ax, lst in zip(axes, drawn):
-        _legend(ax, _run_handles([run for run in runs if run in lst]), loc="best")
-    fig.suptitle("Puzzles still unsolved at the previous step (report split)", color=INK, fontsize=11, x=0.01, ha="left")
+    groups = [Line2D([], [], color=MUTED, linewidth=2, label="unsolved at the previous step"),
+              Line2D([], [], color=MUTED, linewidth=1.6, linestyle="--", label="solved at the previous step")]
+    for ax, lst in drawn.items():
+        handles = _run_handles([run for run in runs if run in lst])
+        _legend(ax, handles + (groups if ax in (ax_zh, ax_zl) and handles else []), loc="best")
+    fig.suptitle("Puzzles still unsolved at the previous step (report split); relative change also for solved puzzles",
+                 color=INK, fontsize=11, x=0.01, ha="left")
     fig.tight_layout()
     return fig
 
@@ -538,5 +567,124 @@ def plot_cycle_histograms(runs: List[Run], log_y: bool = False):
             ax.grid(axis="x", visible=False)
             if log_y:
                 ax.set_yscale("log")
+    fig.tight_layout()
+    return fig
+
+
+# --------------------------------------------------------------------------- distance to the solution
+
+
+def _wrong_cells(run: Run) -> Optional[dict]:
+    w = run.result.get("wrong_cells")
+    if not isinstance(w, dict):
+        note(run, "the analysis has no wrong-cell counts (older capture, or rerun eval_steps.py)")
+        return None
+    return w
+
+
+def plot_wrong_cells_by_step(runs: List[Run]):
+    """Puzzles unsolved at each step: wrong cells (median and quartiles), and the share within 1, 2, 4, 8 cells."""
+    plt = _plt()
+    shown = [(run, w) for run, w in ((run, _wrong_cells(run)) for run in _back_to_front(runs)) if w]
+    if not shown:
+        return None
+    thresholds = list(shown[0][1]["among_unsolved"][0]["share_at_most"])
+    fig = plt.figure(figsize=(15, 7.6))
+    grid = fig.add_gridspec(2, len(thresholds))
+    ax = fig.add_subplot(grid[0, :])
+    small = [fig.add_subplot(grid[1, 0])]
+    small += [fig.add_subplot(grid[1, k], sharey=small[0]) for k in range(1, len(thresholds))]
+    for run, w in shown:
+        entries = w["among_unsolved"]
+        _quartile_band(ax, entries, run.color)
+        steps = [e["step"] for e in entries if e["unsolved"]]
+        for sax, k in zip(small, thresholds):
+            sax.plot(steps, [e["share_at_most"][k] for e in entries if e["unsolved"]], "-o", color=run.color,
+                     linewidth=2, markersize=3)
+    _style(ax, "step", "wrong cells", "Wrong cells of the puzzles unsolved at each step: median and quartiles")
+    ax.set_ylim(bottom=0)
+    for sax, k in zip(small, thresholds):
+        _style(sax, "step", "share of unsolved puzzles" if sax is small[0] else "", f"At most {k} wrong cell{'s' if k != '1' else ''}")
+        sax.set_ylim(0, None)
+    _legend(ax, _run_handles([run for run in runs if run in [r for r, _ in shown]]), loc="upper right")
+    fig.tight_layout()
+    return fig
+
+
+def plot_wrong_cells_at_end(runs: List[Run], log_y: bool = False):
+    """Puzzles unsolved at the last step: wrong cells at the last step, and the minimum ever reached."""
+    plt = _plt()
+    shown = []
+    for run in runs:
+        w = _wrong_cells(run)
+        if w and not w["unsolved_at_last"]["num_unsolved_at_last"]:
+            note(run, "no puzzle is unsolved at the last step")
+        elif w:
+            shown.append((run, w["unsolved_at_last"]))
+    if not shown:
+        return None
+    xmax = max(max(len(e["last_step_counts"]), len(e["minimum_counts"])) for _, e in shown)
+    fig, axes = plt.subplots(len(shown), 2, figsize=(13, 3.0 * len(shown)), squeeze=False, sharex=True)
+    for (ax_last, ax_min), (run, e) in zip(axes, shown):
+        for ax, key, med, title in ((ax_last, "last_step_counts", "last_step_median", "wrong cells at the last step"),
+                                    (ax_min, "minimum_counts", "minimum_median", "fewest wrong cells at any step")):
+            counts = e[key]
+            ax.bar(np.arange(len(counts)), counts, width=0.8, color=run.color)
+            _style(ax, "wrong cells", "puzzles" + (" (log scale)" if log_y else ""),
+                   f"{run.label}: {title} ({e['num_unsolved_at_last']:,} unsolved at the end, median {e[med]:g})")
+            ax.grid(axis="x", visible=False)
+            ax.set_xlim(-0.8, xmax)
+            if log_y:
+                ax.set_yscale("log")
+        if e["minimum_counts"] and e["minimum_counts"][0]:
+            ax_min.annotate(f"{e['minimum_counts'][0]:,} were solved at some step", xy=(0.98, 0.92),
+                            xycoords="axes fraction", ha="right", fontsize=8, color=INK)
+    fig.tight_layout()
+    return fig
+
+
+def solving_rate_by_distance_table(runs: List[Run]) -> Optional[Table]:
+    rows = []
+    for run in runs:
+        w = _wrong_cells(run)
+        for b in (w or {}).get("solving_rate_by_distance", []):
+            rate = "-" if b["rate"] is None else (f"{b['rate']:.4f} [{b['rate_ci_approx'][0]:.4f}, "
+                                                   f"{b['rate_ci_approx'][1]:.4f}]")
+            rows.append([run.label, b["bucket"], f"{b['observations']:,}", f"{b['puzzles']:,}", f"{b['solved']:,}", rate])
+    if not rows:
+        return None
+    return Table(["run", "wrong cells at the previous step", "observations (puzzle, step)", "distinct puzzles",
+                  "solved at the step", "solving rate [approx. 95% interval]"], rows,
+                 "Pooled over steps. An observation is a puzzle unsolved at step s - 1; it is solved if correct at "
+                 "step s. A puzzle contributes one observation per step while unsolved, so the intervals, which treat "
+                 "observations as independent, are approximate.")
+
+
+def plot_solving_rate_by_distance(runs: List[Run], log_y: bool = True):
+    """Solving rate by number of wrong cells at the previous step, one bar per run in each bucket."""
+    plt = _plt()
+    shown = [(run, w["solving_rate_by_distance"]) for run, w in ((run, _wrong_cells(run)) for run in runs) if w]
+    if not shown:
+        return None
+    buckets = [b["bucket"] for b in shown[0][1]]
+    fig, ax = plt.subplots(figsize=(10, 4.4))
+    width = 0.8 / len(shown)
+    for i, (run, entries) in enumerate(shown):
+        by_bucket = {b["bucket"]: b for b in entries}
+        for x, name in enumerate(buckets):
+            b = by_bucket.get(name)
+            if not b or not b["rate"]:
+                continue
+            pos = x - 0.4 + width * (i + 0.5)
+            lo, hi = b["rate_ci_approx"]
+            ax.bar(pos, b["rate"], width=width * 0.92, color=run.color)
+            ax.errorbar(pos, b["rate"], yerr=[[b["rate"] - lo], [hi - b["rate"]]], color=INK, linewidth=1, capsize=2)
+    ax.set_xticks(range(len(buckets)), buckets)
+    _style(ax, "wrong cells at the previous step", "share solved at the step" + (" (log scale)" if log_y else ""),
+           "Solving rate by distance to the solution (pooled over steps; approximate 95% intervals)")
+    ax.grid(axis="x", visible=False)
+    if log_y:
+        _plain_log(ax)
+    _legend(ax, _run_handles([run for run, _ in shown]), loc="upper right")
     fig.tight_layout()
     return fig

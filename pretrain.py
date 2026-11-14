@@ -412,7 +412,8 @@ def evaluate(
             return_keys.update(evaluator.required_outputs)
 
         # Optional per-step capture, per puzzle and step: halt logits, correctness, grid change and
-        # hash, relative state changes (about 22 bytes per puzzle and step with one auxiliary head)
+        # hash, wrong and changed cells, relative state changes (about 24 bytes per puzzle and step with one
+        # auxiliary head)
         capture_steps = config.eval_capture_steps
         halt_head = config.eval_halt_head if config.eval_halt_enable else None
         if capture_steps:

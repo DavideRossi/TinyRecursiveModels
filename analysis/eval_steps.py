@@ -15,6 +15,8 @@ pretrain.evaluate. Each is a torch.save dict with
     preds_changed                           bool    [P, S]   predicted grid differs from the previous step
     z_H_rel_change, z_L_rel_change          float   [P, S]   relative change of the states from the previous step
     pred_hash                               int64   [P, S]   hash of the predicted grid (equal grids, equal hashes)
+    wrong_cells                             int     [P, S]   labelled cells predicted wrong (0 <=> seq_is_correct)
+    cells_changed                           int     [P, S]   cells whose prediction changed from the previous step
     halt_step, eval_halt_head, eval_halt_threshold           in-loop halting, if it was enabled
 
 The capture always holds every step up to the evaluation step limit S (any value), whatever
@@ -47,9 +49,10 @@ Outputs in OUT_DIR:
                              table, oracle, flips, t = 0 point, operating points (each with
                              the number of puzzles halting at every step), share of unsolved
                              puzzles whose grid did not change, quartiles of their relative
-                             state change, solving rate per step, repeated grids and cycles
-                             among the puzzles unsolved at the last step; under "truncated"
-                             the same for the first K steps
+                             state change (also for solved puzzles), solving rate per step,
+                             repeated grids and cycles among the puzzles unsolved at the last
+                             step, wrong and changed cells, solving rate by number of wrong
+                             cells; under "truncated" the same for the first K steps
     curves_<set>.png         accuracy vs average steps (needs matplotlib; skipped otherwise)
 """
 import argparse
@@ -67,7 +70,8 @@ import numpy as np
 AUX_PREFIX = "aux_halt_logits/"
 Q_HEAD = "q_head"
 PER_PUZZLE_KEYS = ("puzzle_identifiers", "example_index", "set_id", "num_steps")
-OPTIONAL_KEYS = ("preds_changed", "z_H_rel_change", "z_L_rel_change", "pred_hash", "halt_step")  # newer captures
+OPTIONAL_KEYS = ("preds_changed", "z_H_rel_change", "z_L_rel_change", "pred_hash", "wrong_cells", "cells_changed",
+                 "halt_step")  # newer captures
 HALT_META_KEYS = ("eval_halt_head", "eval_halt_threshold")
 
 
@@ -208,6 +212,11 @@ def load(ckpt_dir: str, step: int, data_dir: Optional[str] = None) -> (dict, dic
 
     checks = {"files": files, "num_steps": num_steps, "heads": list(data["logits"]),
               "set_names": data["set_names"], **dup_report, "per_set": check_missing(data, data_dir)}
+    if "wrong_cells" in data:
+        mismatches = int(((data["wrong_cells"] == 0) != data["seq_is_correct"]).sum())
+        if mismatches:
+            raise ValueError(f"{mismatches} (puzzle, step) entries where wrong_cells == 0 disagrees with seq_is_correct")
+        checks["wrong_cells_match_correctness"] = True
     if "halt_step" in data:
         checks["in_loop_halting"] = in_loop_halting(data)
     return data, checks
@@ -313,18 +322,86 @@ def unchanged_among_unsolved(correct: np.ndarray, preds_changed: np.ndarray) -> 
     return out
 
 
-def state_change_among_unsolved(correct: np.ndarray, rel_change: np.ndarray) -> List[Optional[dict]]:
-    """Per step s >= 2: quartiles of the relative state change at step s, over puzzles wrong at step s - 1.
+def _quartiles(values: np.ndarray) -> dict:
+    values = values.astype(np.float64)
+    values = values[np.isfinite(values)]
+    q = np.percentile(values, [25, 50, 75]).tolist() if len(values) else [None, None, None]
+    return {"q25": q[0], "median": q[1], "q75": q[2]}
+
+
+def state_change_among_unsolved(correct: np.ndarray, rel_change: np.ndarray, solved: bool = False) -> List[Optional[dict]]:
+    """Per step s >= 2: quartiles of the relative state change at step s, over puzzles wrong at step s - 1
+    (solved=True: over puzzles correct at step s - 1).
 
     Same layout and same puzzles as unchanged_among_unsolved. Non-finite values are ignored.
     """
     out: List[Optional[dict]] = [None]
+    count_key = "solved_at_previous_step" if solved else "unsolved_at_previous_step"
     for s in range(1, correct.shape[1]):
-        values = rel_change[~correct[:, s - 1], s].astype(np.float64)
-        values = values[np.isfinite(values)]
-        q = np.percentile(values, [25, 50, 75]).tolist() if len(values) else [None, None, None]
-        out.append({"step": s + 1, "unsolved_at_previous_step": int((~correct[:, s - 1]).sum()),
-                    "q25": q[0], "median": q[1], "q75": q[2]})
+        group = correct[:, s - 1] if solved else ~correct[:, s - 1]
+        out.append({"step": s + 1, count_key: int(group.sum()), **_quartiles(rel_change[group, s])})
+    return out
+
+
+def cells_changed_among_unsolved(correct: np.ndarray, cells_changed: np.ndarray) -> List[Optional[dict]]:
+    """Per step s >= 2: quartiles of the number of cells changed at step s, over puzzles wrong at step s - 1."""
+    out: List[Optional[dict]] = [None]
+    for s in range(1, correct.shape[1]):
+        group = ~correct[:, s - 1]
+        out.append({"step": s + 1, "unsolved_at_previous_step": int(group.sum()), **_quartiles(cells_changed[group, s]),
+                    "mean": float(cells_changed[group, s].mean()) if group.any() else None})
+    return out
+
+
+WRONG_CELL_THRESHOLDS = (1, 2, 4, 8)
+DISTANCE_BUCKETS = ((1, 1), (2, 2), (3, 4), (5, 8), (9, None))  # inclusive ranges of wrong cells; None: no upper end
+
+
+def _bucket_label(lo: int, hi: Optional[int]) -> str:
+    return f"{lo}+" if hi is None else str(lo) if lo == hi else f"{lo}-{hi}"
+
+
+def wrong_cells_among_unsolved(correct: np.ndarray, wrong: np.ndarray) -> List[dict]:
+    """Per step s >= 1, over puzzles wrong at step s: quartiles of the number of wrong cells and the
+    share with at most k wrong cells for k in WRONG_CELL_THRESHOLDS."""
+    out = []
+    for s in range(correct.shape[1]):
+        values = wrong[~correct[:, s], s]
+        n = len(values)
+        out.append({"step": s + 1, "unsolved": n, **_quartiles(values),
+                    "share_at_most": {str(k): float((values <= k).mean()) if n else None for k in WRONG_CELL_THRESHOLDS}})
+    return out
+
+
+def wrong_cells_unsolved_at_last(correct: np.ndarray, wrong: np.ndarray) -> dict:
+    """Puzzles wrong at the last step: counts by number of wrong cells at the last step and by the
+    minimum over all steps (entry k = puzzles with k wrong cells; 0 is possible for the minimum if
+    a puzzle was correct at some step and lost it)."""
+    unsolved = ~correct[:, -1]
+    last = wrong[unsolved, -1].astype(np.int64)
+    minimum = wrong[unsolved].min(axis=1).astype(np.int64)
+    return {"num_unsolved_at_last": int(unsolved.sum()),
+            "last_step_counts": np.bincount(last).tolist() if len(last) else [],
+            "minimum_counts": np.bincount(minimum).tolist() if len(minimum) else [],
+            "last_step_median": float(np.median(last)) if len(last) else None,
+            "minimum_median": float(np.median(minimum)) if len(minimum) else None}
+
+
+def solving_rate_by_distance(correct: np.ndarray, wrong: np.ndarray, buckets=DISTANCE_BUCKETS) -> List[dict]:
+    """Over all pairs (puzzle, step s >= 2) with the puzzle wrong at step s - 1, grouped by its number
+    of wrong cells at s - 1: how many pairs, how many distinct puzzles behind them, how many are
+    solved at step s, the rate and a Wilson interval. The interval treats pairs as independent,
+    which they are not (a puzzle contributes one pair per step while unsolved): it is approximate."""
+    prev_unsolved = ~correct[:, :-1]
+    prev_wrong = wrong[:, :-1].astype(np.int64)
+    solved_now = correct[:, 1:]
+    out = []
+    for lo, hi in buckets:
+        in_bucket = prev_unsolved & (prev_wrong >= lo) & (prev_wrong <= (hi if hi is not None else np.iinfo(np.int64).max))
+        n, solved = int(in_bucket.sum()), int((in_bucket & solved_now).sum())
+        out.append({"bucket": _bucket_label(lo, hi), "min_wrong_cells": lo, "max_wrong_cells": hi,
+                    "observations": n, "puzzles": int(in_bucket.any(axis=1).sum()), "solved": solved,
+                    "rate": solved / n if n else None, "rate_ci_approx": wilson_interval(solved, n) if n else None})
     return out
 
 
@@ -565,6 +642,23 @@ def analyze_group(data: dict, rows: np.ndarray, selection: np.ndarray, tolerance
         z: state_change_among_unsolved(c_rep, data[f"{z}_rel_change"][rows][:, steps][rep])
         if f"{z}_rel_change" in data else f"not available: the capture has no {z}_rel_change"
         for z in ("z_H", "z_L")}
+    result["state_change_among_solved"] = {
+        z: state_change_among_unsolved(c_rep, data[f"{z}_rel_change"][rows][:, steps][rep], solved=True)
+        if f"{z}_rel_change" in data else f"not available: the capture has no {z}_rel_change"
+        for z in ("z_H", "z_L")}
+    if "cells_changed" in data:
+        result["cells_changed_among_unsolved"] = cells_changed_among_unsolved(c_rep, data["cells_changed"][rows][:, steps][rep])
+    else:
+        result["cells_changed_among_unsolved"] = "not available: the capture has no cells_changed"
+    if "wrong_cells" in data:
+        w_rep = data["wrong_cells"][rows][:, steps][rep]
+        result["wrong_cells"] = {
+            "among_unsolved": wrong_cells_among_unsolved(c_rep, w_rep),
+            "unsolved_at_last": wrong_cells_unsolved_at_last(c_rep, w_rep),
+            "solving_rate_by_distance": solving_rate_by_distance(c_rep, w_rep),
+        }
+    else:
+        result["wrong_cells"] = "not available: the capture has no wrong_cells"
     result["solving_rate"] = solving_rate(c_rep)
     if "pred_hash" in data:
         result["cycles"] = cycle_analysis(c_rep, data["pred_hash"][rows][:, steps][rep])

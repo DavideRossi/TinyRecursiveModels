@@ -86,6 +86,13 @@ def grid_hash(preds: torch.Tensor) -> torch.Tensor:
     return ((tokens + 1) * _grid_hash_coefficients[key]).sum(dim=1)
 
 
+def cell_count_dtype(num_cells: int) -> torch.dtype:
+    """Smallest integer dtype holding counts from 0 to num_cells."""
+    if num_cells <= 255:
+        return torch.uint8
+    return torch.int16 if num_cells <= 32767 else torch.int32
+
+
 def relative_change(new: torch.Tensor, old: torch.Tensor) -> torch.Tensor:
     """Per puzzle: ||new - old|| / ||old|| over all positions and dimensions, in float32."""
     new, old = new.to(torch.float32).flatten(1), old.to(torch.float32).flatten(1)
@@ -111,7 +118,8 @@ def run_eval_batch(
     Returns a dict with: metrics, preds (the reported outputs), inference_steps, and
     - step_records (if capture_steps): quantity -> list over steps of [B] tensors with the RAW
       values of every step, whatever the halting settings. Compact dtypes: bool flags, float16
-      relative state changes, int64 grid hashes (pred_hash), float32 halt logits;
+      relative state changes, int64 grid hashes (pred_hash), float32 halt logits, cell counts
+      (wrong_cells, cells_changed) in the smallest integer dtype for the sequence length;
     - halt_step (if halting): [B] int32.
     """
     return_keys = set(return_keys)
@@ -134,14 +142,19 @@ def run_eval_batch(
             for k, v in preds.items():
                 if k.startswith(AUX_HALT_LOGITS_KEY + "/"):
                     step_records.setdefault(k, []).append(v)
-            step_records.setdefault("seq_is_correct", []).append(compute_correctness(preds["preds"], batch["labels"])[3])
+            _, loss_counts, is_correct, seq_is_correct = compute_correctness(preds["preds"], batch["labels"])
+            step_records.setdefault("seq_is_correct", []).append(seq_is_correct)
+            # Same mask and definition as seq_is_correct: 0 wrong cells <=> seq_is_correct
+            count_dtype = cell_count_dtype(preds["preds"].flatten(1).shape[1])
+            step_records.setdefault("wrong_cells", []).append((loss_counts - is_correct.sum(-1)).to(count_dtype))
 
-            # Changes with respect to the previous step (step 1 has none: False / NaN)
+            # Changes with respect to the previous step (step 1 has none: False / 0 / NaN)
             if prev_preds is None:
-                changed = torch.zeros(preds["preds"].shape[0], dtype=torch.bool, device=preds["preds"].device)
+                cells_changed = torch.zeros(preds["preds"].shape[0], dtype=count_dtype, device=preds["preds"].device)
             else:
-                changed = (preds["preds"] != prev_preds).flatten(1).any(dim=1)
-            step_records.setdefault("preds_changed", []).append(changed)
+                cells_changed = (preds["preds"] != prev_preds).flatten(1).sum(dim=1).to(count_dtype)
+            step_records.setdefault("cells_changed", []).append(cells_changed)
+            step_records.setdefault("preds_changed", []).append(cells_changed > 0)
             prev_preds = preds["preds"]
             step_records.setdefault("pred_hash", []).append(grid_hash(preds["preds"]))
 

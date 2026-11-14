@@ -43,7 +43,10 @@ def make_analysis(d, name, S, seed, new_capture=True, aux_name="probe"):
         hashes = rng.integers(-2 ** 62, 2 ** 62, size=(P, S), dtype=np.int64)
         hashes[:150, 3:] = hashes[:150, 3:4]                    # frozen from step 4
         hashes[150:250, 4:] = hashes[150:250, 2 + np.arange(S - 4) % 2]  # period 2 from step 5
-        extra = {"preds_changed": changed, "rel_change": rel, "pred_hash": hashes}
+        wrong = np.where(correct, 0, rng.integers(1, 30, size=(P, S))).astype(np.uint8)
+        cells_changed = np.where(changed, rng.integers(1, 10, size=(P, S)), 0).astype(np.uint8)
+        extra = {"preds_changed": changed, "rel_change": rel, "pred_hash": hashes,
+                 "cells": {"wrong_cells": wrong, "cells_changed": cells_changed}}
     ckpt = os.path.join(d, name)
     os.makedirs(ckpt)
     _write_rank(os.path.join(ckpt, "step_1_eval_steps.0"), logits, logits + 0.5, correct, np.arange(P),
@@ -136,8 +139,12 @@ def test_views_skip_what_a_run_lacks():
         assert len(fig.axes) == 2
 
         fig, out = captured(report.plot_stuck_vs_moving, runs)
-        assert out.count("[old] skipped") == 3 and "[new]" not in out
-        assert [len(ax.lines) for ax in fig.axes] == [1, 1, 1]
+        assert out.count("[old] skipped") == 4 and "[new]" not in out
+        # grid unchanged, cells changed, z_H and z_L (unsolved solid, solved dashed)
+        assert [len(ax.lines) for ax in fig.axes] == [1, 1, 2, 2]
+        assert [l.get_linestyle() for l in fig.axes[2].lines] == ["-", "--"]
+        z = runs[0].result["state_change_among_solved"]["z_H"]
+        assert np.allclose(fig.axes[2].lines[1].get_ydata(), [e["median"] for e in z[1:] if e["median"]])
 
         fig, out = captured(report.plot_halting_steps, runs, ["q_head"], log_y=True)
         assert out.count("[old] skipped") == 1 and "[new]" not in out
@@ -171,6 +178,29 @@ def test_views_skip_what_a_run_lacks():
             result, out = captured(view, runs[1:])
             assert result is None and "skipped" in out
 
+        # Distance to the solution: only the new capture has wrong-cell counts
+        w = runs[0].result["wrong_cells"]
+        fig, out = captured(report.plot_wrong_cells_by_step, runs)
+        assert out.count("[old] skipped") == 1 and len(fig.axes) == 5
+        assert np.allclose(fig.axes[0].lines[0].get_ydata(), [e["median"] for e in w["among_unsolved"]])
+        assert np.allclose(fig.axes[1].lines[0].get_ydata(), [e["share_at_most"]["1"] for e in w["among_unsolved"]])
+        fig, out = captured(report.plot_wrong_cells_at_end, runs, log_y=True)
+        assert out.count("[old] skipped") == 1 and len(fig.axes) == 2
+        assert [p.get_height() for p in fig.axes[0].patches] == w["unsolved_at_last"]["last_step_counts"]
+        assert [p.get_height() for p in fig.axes[1].patches] == w["unsolved_at_last"]["minimum_counts"]
+        table, out = captured(report.solving_rate_by_distance_table, runs)
+        assert out.count("[old] skipped") == 1 and len(table.rows) == 5
+        b = w["solving_rate_by_distance"][0]
+        assert table.rows[0][1:5] == [b["bucket"], f"{b['observations']:,}", f"{b['puzzles']:,}", f"{b['solved']:,}"]
+        fig, out = captured(report.plot_solving_rate_by_distance, runs)
+        assert out.count("[old] skipped") == 1
+        assert sorted(p.get_height() for p in fig.axes[0].patches) == sorted(
+            x["rate"] for x in w["solving_rate_by_distance"] if x["rate"])
+        for view in (report.plot_wrong_cells_by_step, report.plot_wrong_cells_at_end,
+                     report.solving_rate_by_distance_table, report.plot_solving_rate_by_distance):
+            result, out = captured(view, runs[1:])
+            assert result is None and "skipped" in out
+
         # An analysis written before the solving rate existed
         del runs[1].result["solving_rate"]
         fig, out = captured(report.plot_accuracy_by_step, runs)
@@ -197,11 +227,12 @@ def _have_notebook_tools():
         return False
 
 
-def _check_executed(nb, min_figures, max_figures, min_tables):
+def _check_executed(nb, figures, tables):
+    """figures, tables: (min, max) numbers of figures and HTML tables in the outputs."""
     outputs = [o for c in nb.cells if c.cell_type == "code" for o in c.outputs]
-    assert not [o for o in outputs if o.output_type == "error"]
-    assert min_figures <= sum("image/png" in o.get("data", {}) for o in outputs) <= max_figures
-    assert min_tables <= sum("text/html" in o.get("data", {}) for o in outputs) <= 4
+    assert not [o for o in outputs if o.output_type == "error"], [o for o in outputs if o.output_type == "error"]
+    assert figures[0] <= sum("image/png" in o.get("data", {}) for o in outputs) <= figures[1]
+    assert tables[0] <= sum("text/html" in o.get("data", {}) for o in outputs) <= tables[1]
     return "".join(o.get("text", "") for o in outputs if o.output_type == "stream")
 
 
@@ -222,7 +253,7 @@ def test_notebook_runs_on_synthetic_output():
         old = make_analysis(d, "old", 6, 5, new_capture=False)
         source = (f"RUNS = {{'half': ({new!r}, 4), 'full': {new!r}, 'old': {old!r}}}\n"
                   "HEADS = ['q_head', 'probe']\nSET_NAME = 'all'\nLOG_HISTOGRAMS = False")
-        notes = _check_executed(_execute_notebook(source), 6, 6, 4)
+        notes = _check_executed(_execute_notebook(source), (9, 9), (5, 5))
         assert "[old] skipped" in notes and "[full]" not in notes
 
 
@@ -234,8 +265,8 @@ def test_notebook_runs_on_the_32_step_analysis():
     if not os.path.exists(os.path.join(REAL_OUTPUT, "summary.json")):
         print(f"  (skipped: {os.path.relpath(REAL_OUTPUT, ROOT)} not present)")
         return
-    # 4 figures and 3 tables without grid hashes in the capture, 6 and 4 with them
-    _check_executed(_execute_notebook(None), 4, 6, 3)
+    # 4 figures and 3 tables from a capture without grid hashes and cell counts; 9 and 5 with them
+    _check_executed(_execute_notebook(None), (4, 9), (3, 5))
 
 
 if __name__ == "__main__":

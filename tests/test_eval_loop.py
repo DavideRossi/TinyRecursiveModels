@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.join(HERE, ".."))
 sys.path.insert(0, HERE)
 
 from analysis import eval_steps as es  # noqa: E402
-from utils.eval_loop import FrozenOutputs, run_eval_batch, halt_logit_key, grid_hash, grid_hash_coefficients  # noqa: E402
+from utils.eval_loop import FrozenOutputs, run_eval_batch, halt_logit_key, grid_hash, grid_hash_coefficients, cell_count_dtype  # noqa: E402
 from test_aux_halt_heads import make_model, make_batch, AUX, BATCH  # noqa: E402
 
 COEF_0 = -539115568831144627  # grid_hash_coefficients(1)[0]
@@ -234,6 +234,38 @@ def test_capture_change_records():
     assert rec["pred_hash"].dtype == torch.int64 and rec["pred_hash"].shape == (BATCH, EVAL_STEPS)
     assert torch.equal(rec["pred_hash"][:, 1:] != rec["pred_hash"][:, :-1], expected)
     assert torch.equal(rec["pred_hash"], torch.stack([grid_hash(all_preds[:, s]) for s in range(EVAL_STEPS)], 1))
+
+
+def test_capture_cell_counts():
+    model = make_eval_model(eval_halt_max_steps=EVAL_STEPS)
+    batch = make_eval_batch(model)
+    rec = {k: torch.stack(v, 1) for k, v in evaluate_batch(model, batch, capture_steps=True)["step_records"].items()}
+    all_preds = per_step_preds(model, batch)  # [B, S, L]
+
+    for k in ("wrong_cells", "cells_changed"):
+        assert rec[k].dtype == torch.uint8 and rec[k].shape == (BATCH, EVAL_STEPS)
+    # Wrong cells: direct per-cell count over the labelled cells
+    labels = batch["labels"][:, None, :]
+    direct = ((all_preds != labels) & (labels != -100)).sum(-1)
+    assert torch.equal(rec["wrong_cells"].long(), direct)
+    # 0 wrong cells exactly when the puzzle is correct, and the capture has both outcomes
+    assert torch.equal(rec["wrong_cells"] == 0, rec["seq_is_correct"])
+    assert rec["seq_is_correct"].any() and (~rec["seq_is_correct"]).any()
+    # Changed cells: direct count, 0 at step 1, > 0 exactly when the grid changed
+    assert torch.equal(rec["cells_changed"][:, 1:].long(), (all_preds[:, 1:] != all_preds[:, :-1]).sum(-1))
+    assert not rec["cells_changed"][:, 0].any()
+    assert torch.equal(rec["cells_changed"] > 0, rec["preds_changed"])
+
+    # Ignored cells do not count as wrong
+    masked = dict(batch, labels=batch["labels"].clone())
+    masked["labels"][:, :5] = -100
+    rec2 = {k: torch.stack(v, 1) for k, v in evaluate_batch(model, masked, capture_steps=True)["step_records"].items()}
+    direct2 = ((all_preds[..., 5:] != masked["labels"][:, None, 5:])).sum(-1)
+    assert torch.equal(rec2["wrong_cells"].long(), direct2)
+    assert torch.equal(rec2["wrong_cells"] == 0, rec2["seq_is_correct"])
+
+    assert [cell_count_dtype(n) for n in (81, 255, 256, 900, 32767, 40000)] == \
+        [torch.uint8, torch.uint8, torch.int16, torch.int16, torch.int16, torch.int32]
 
 
 def test_grid_hash():
