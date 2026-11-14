@@ -24,7 +24,7 @@ from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMeta
 from utils.functions import load_model_class, get_model_source_path
 from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
 from models.ema import EMAHelper
-from utils.eval_halting import run_eval_batch
+from utils.eval_loop import run_eval_batch
 
 
 class LossConfig(pydantic.BaseModel):
@@ -411,7 +411,8 @@ def evaluate(
             evaluator.begin_eval()
             return_keys.update(evaluator.required_outputs)
 
-        # Optional per-step capture (compact: halt logits + correctness per puzzle and step)
+        # Optional per-step capture, per puzzle and step: halt logits, correctness, grid change and
+        # hash, relative state changes (about 22 bytes per puzzle and step with one auxiliary head)
         capture_steps = config.eval_capture_steps
         halt_head = config.eval_halt_head if config.eval_halt_enable else None
         if capture_steps:
@@ -517,8 +518,8 @@ def evaluate(
                 if tensors[0].ndim == 1:
                     return torch.cat(tensors, dim=0)
                 # [num_puzzles, num_steps]; pad batches that finished early (not expected in eval:
-                # every sequence runs halt_max_steps) with False / NaN. num_steps records the real count.
-                fill = False if tensors[0].dtype == torch.bool else float("nan")
+                # every sequence runs halt_max_steps) with False / NaN / 0. num_steps records the real count.
+                fill = False if tensors[0].dtype == torch.bool else float("nan") if tensors[0].is_floating_point() else 0
                 padded = []
                 for t in tensors:
                     if t.shape[1] < max_steps:

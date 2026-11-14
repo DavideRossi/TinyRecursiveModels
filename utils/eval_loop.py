@@ -55,6 +55,37 @@ class FrozenOutputs:
         return newly
 
 
+GRID_HASH_SEED = 0x5EED0F6B1D5  # constant: grid hashes are comparable across runs
+_MASK64 = (1 << 64) - 1
+_grid_hash_coefficients: Dict[Any, torch.Tensor] = {}
+
+
+def grid_hash_coefficients(length: int) -> List[int]:
+    """One fixed odd 64-bit integer per grid position (as signed int64 values).
+
+    splitmix64 of (GRID_HASH_SEED + position) in plain integer arithmetic: the values depend on
+    no library's random generator, and no generator state is read or changed.
+    """
+    out = []
+    for i in range(length):
+        z = (GRID_HASH_SEED + (i + 1) * 0x9E3779B97F4A7C15) & _MASK64
+        z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & _MASK64
+        z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & _MASK64
+        z = (z ^ (z >> 31)) | 1
+        out.append(z - (1 << 64) if z >= (1 << 63) else z)
+    return out
+
+
+def grid_hash(preds: torch.Tensor) -> torch.Tensor:
+    """64-bit hash (int64) of each predicted grid: sum over positions of (token + 1) * coefficient,
+    with wraparound. Two grids differing in one position always get different hashes."""
+    tokens = preds.flatten(1).to(torch.int64)
+    key = (tokens.shape[1], tokens.device)
+    if key not in _grid_hash_coefficients:
+        _grid_hash_coefficients[key] = torch.tensor(grid_hash_coefficients(tokens.shape[1]), dtype=torch.int64, device=tokens.device)
+    return ((tokens + 1) * _grid_hash_coefficients[key]).sum(dim=1)
+
+
 def relative_change(new: torch.Tensor, old: torch.Tensor) -> torch.Tensor:
     """Per puzzle: ||new - old|| / ||old|| over all positions and dimensions, in float32."""
     new, old = new.to(torch.float32).flatten(1), old.to(torch.float32).flatten(1)
@@ -79,7 +110,8 @@ def run_eval_batch(
 
     Returns a dict with: metrics, preds (the reported outputs), inference_steps, and
     - step_records (if capture_steps): quantity -> list over steps of [B] tensors with the RAW
-      values of every step, whatever the halting settings;
+      values of every step, whatever the halting settings. Compact dtypes: bool flags, float16
+      relative state changes, int64 grid hashes (pred_hash), float32 halt logits;
     - halt_step (if halting): [B] int32.
     """
     return_keys = set(return_keys)
@@ -111,6 +143,7 @@ def run_eval_batch(
                 changed = (preds["preds"] != prev_preds).flatten(1).any(dim=1)
             step_records.setdefault("preds_changed", []).append(changed)
             prev_preds = preds["preds"]
+            step_records.setdefault("pred_hash", []).append(grid_hash(preds["preds"]))
 
             inner_carry = getattr(carry, "inner_carry", None)
             for name in ("z_H", "z_L"):
@@ -121,7 +154,7 @@ def run_eval_batch(
                     change = relative_change(z, prev_z[name])
                 else:
                     change = torch.full((z.shape[0], ), float("nan"), dtype=torch.float32, device=z.device)
-                step_records.setdefault(f"{name}_rel_change", []).append(change)
+                step_records.setdefault(f"{name}_rel_change", []).append(change.to(torch.float16))
                 prev_z[name] = z
 
         if frozen is not None:

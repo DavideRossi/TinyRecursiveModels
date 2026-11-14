@@ -2,7 +2,7 @@
 
 Standalone: reads the capture files only (no model, no GPU, no training code).
 
-    python analysis/halt_curves.py CKPT_DIR STEP OUT_DIR [options]
+    python analysis/eval_steps.py CKPT_DIR STEP OUT_DIR [options]
 
 CKPT_DIR holds step_<STEP>_eval_steps.<rank> files (one per rank), written by
 pretrain.evaluate. Each is a torch.save dict with
@@ -13,7 +13,8 @@ pretrain.evaluate. Each is a torch.save dict with
     set_names                               list of str (indexed by set_id)
   and, in newer captures,
     preds_changed                           bool    [P, S]   predicted grid differs from the previous step
-    z_H_rel_change, z_L_rel_change          float32 [P, S]   relative change of the states (not used here)
+    z_H_rel_change, z_L_rel_change          float   [P, S]   relative change of the states from the previous step
+    pred_hash                               int64   [P, S]   hash of the predicted grid (equal grids, equal hashes)
     halt_step, eval_halt_head, eval_halt_threshold           in-loop halting, if it was enabled
 
 The capture always holds every step up to the evaluation step limit S (any value), whatever
@@ -43,8 +44,11 @@ Outputs in OUT_DIR:
     curve_<set>_<head>.csv   threshold, avg_steps, accuracy, frac_halted_early
                              (curve_<set>_<head>_first<K>.csv for --truncate-steps)
     summary.json             checks, split, per set: full-step accuracy, fixed-step
-                             table, oracle, flips, t = 0 point, operating points, share of
-                             unsolved puzzles whose grid did not change; under "truncated"
+                             table, oracle, flips, t = 0 point, operating points (each with
+                             the number of puzzles halting at every step), share of unsolved
+                             puzzles whose grid did not change, quartiles of their relative
+                             state change, solving rate per step, repeated grids and cycles
+                             among the puzzles unsolved at the last step; under "truncated"
                              the same for the first K steps
     curves_<set>.png         accuracy vs average steps (needs matplotlib; skipped otherwise)
 """
@@ -63,7 +67,7 @@ import numpy as np
 AUX_PREFIX = "aux_halt_logits/"
 Q_HEAD = "q_head"
 PER_PUZZLE_KEYS = ("puzzle_identifiers", "example_index", "set_id", "num_steps")
-OPTIONAL_KEYS = ("preds_changed", "z_H_rel_change", "z_L_rel_change", "halt_step")  # newer captures
+OPTIONAL_KEYS = ("preds_changed", "z_H_rel_change", "z_L_rel_change", "pred_hash", "halt_step")  # newer captures
 HALT_META_KEYS = ("eval_halt_head", "eval_halt_threshold")
 
 
@@ -309,6 +313,168 @@ def unchanged_among_unsolved(correct: np.ndarray, preds_changed: np.ndarray) -> 
     return out
 
 
+def state_change_among_unsolved(correct: np.ndarray, rel_change: np.ndarray) -> List[Optional[dict]]:
+    """Per step s >= 2: quartiles of the relative state change at step s, over puzzles wrong at step s - 1.
+
+    Same layout and same puzzles as unchanged_among_unsolved. Non-finite values are ignored.
+    """
+    out: List[Optional[dict]] = [None]
+    for s in range(1, correct.shape[1]):
+        values = rel_change[~correct[:, s - 1], s].astype(np.float64)
+        values = values[np.isfinite(values)]
+        q = np.percentile(values, [25, 50, 75]).tolist() if len(values) else [None, None, None]
+        out.append({"step": s + 1, "unsolved_at_previous_step": int((~correct[:, s - 1]).sum()),
+                    "q25": q[0], "median": q[1], "q75": q[2]})
+    return out
+
+
+def wilson_interval(successes: int, n: int, z: float = 1.959963984540054) -> List[float]:
+    """Wilson score interval (95% by default) for a binomial proportion."""
+    p = successes / n
+    center = (p + z * z / (2 * n)) / (1 + z * z / n)
+    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / (1 + z * z / n)
+    return [0.0 if successes == 0 else max(0.0, center - half), 1.0 if successes == n else min(1.0, center + half)]
+
+
+def solving_rate(correct: np.ndarray) -> List[Optional[dict]]:
+    """Per step s >= 2: of the puzzles wrong at step s - 1, the fraction correct at step s.
+
+    Entry s - 1 describes step s (None for step 1). "unsolved" is the number wrong at step s.
+    """
+    out: List[Optional[dict]] = [None]
+    for s in range(1, correct.shape[1]):
+        n = int((~correct[:, s - 1]).sum())
+        solved = int((~correct[:, s - 1] & correct[:, s]).sum())
+        out.append({"step": s + 1, "unsolved_at_previous_step": n, "solved": solved,
+                    "rate": solved / n if n else None, "rate_ci": wilson_interval(solved, n) if n else None,
+                    "unsolved": int((~correct[:, s]).sum())})
+    return out
+
+
+CYCLE_CLASSES = ("frozen", "cycling", "revisiting", "wandering")
+
+
+def previous_occurrence(hashes: np.ndarray) -> np.ndarray:
+    """[U, S] -> for each step, the index of the most recent earlier step of the same row with
+    the same hash, or -1. One stable sort per row: equal hashes become neighbours, in step order."""
+    order = np.argsort(hashes, axis=1, kind="stable")
+    ordered = np.take_along_axis(hashes, order, axis=1)
+    prev_sorted = np.full(order.shape, -1, dtype=np.int64)
+    prev_sorted[:, 1:] = np.where(ordered[:, 1:] == ordered[:, :-1], order[:, :-1], -1)
+    prev = np.empty_like(prev_sorted)
+    np.put_along_axis(prev, order, prev_sorted, axis=1)
+    return prev
+
+
+def _periodic_from(hashes: np.ndarray, start: np.ndarray, period: np.ndarray) -> np.ndarray:
+    """Per row: hashes[s] == hashes[s - period] for every index s >= start (rows with period 0: False)."""
+    out = np.zeros(len(hashes), dtype=bool)
+    S = hashes.shape[1]
+    for p in np.unique(period[period > 0]):
+        rows = np.flatnonzero(period == p)
+        equal = hashes[rows, p:] == hashes[rows, :-p]
+        out[rows] = (equal | (np.arange(p, S)[None, :] < start[rows, None])).all(axis=1)
+    return out
+
+
+def cycle_records(hashes: np.ndarray, chunk: int = 50000) -> Dict[str, np.ndarray]:
+    """Per row of grid hashes [U, S] (steps counted from 1 in the results):
+
+    first_repeat_step  first step whose grid equals a grid of an earlier step (0: no grid repeats)
+    period             at that step, the distance to the most recent identical grid (0: none)
+    confirmed          from that step to the last, every grid equals the one `period` steps before
+    distinct           number of distinct grids
+    ends_periodic      with p the distance from the last grid to its most recent copy, the last p
+                       grids all equal the ones p steps before (one full period at the end)
+    """
+    parts: Dict[str, list] = {k: [] for k in ("first_repeat_step", "period", "confirmed", "distinct", "ends_periodic")}
+    S = hashes.shape[1]
+    for a in range(0, len(hashes), chunk):
+        h = hashes[a:a + chunk]
+        rows = np.arange(len(h))
+        prev = previous_occurrence(h)
+        repeat = prev >= 0
+        any_repeat = repeat.any(axis=1)
+        first = repeat.argmax(axis=1)
+        period = np.where(any_repeat, first - prev[rows, first], 0)
+        last_period = np.where(prev[:, -1] >= 0, S - 1 - prev[:, -1], 0)
+        last_period[2 * last_period > S] = 0  # a full period at the end cannot be checked
+        parts["first_repeat_step"].append(np.where(any_repeat, first + 1, 0))
+        parts["period"].append(period)
+        parts["confirmed"].append(_periodic_from(h, first, period))
+        parts["distinct"].append((~repeat).sum(axis=1))
+        parts["ends_periodic"].append(_periodic_from(h, S - last_period, last_period))
+    if not parts["period"]:
+        return {k: np.zeros(0, dtype=bool if k in ("confirmed", "ends_periodic") else np.int64) for k in parts}
+    return {k: np.concatenate(v) for k, v in parts.items()}
+
+
+def classify_cycles(records: Dict[str, np.ndarray]) -> np.ndarray:
+    """Index into CYCLE_CLASSES per row: frozen (period 1, confirmed to the end), cycling
+    (period > 1, confirmed), revisiting (a grid repeats, not periodic), wandering (no repeat)."""
+    repeats = records["first_repeat_step"] > 0
+    return np.where(~repeats, 3, np.where(~records["confirmed"], 2, np.where(records["period"] == 1, 0, 1)))
+
+
+def _value_counts(values: np.ndarray) -> Dict[str, int]:
+    u, n = np.unique(values, return_counts=True)
+    return {str(int(k)): int(v) for k, v in zip(u, n)}
+
+
+def cycle_analysis(correct: np.ndarray, hashes: np.ndarray) -> dict:
+    """Repeated grids and cycles among the puzzles unsolved at the last step.
+
+    Equal hashes mean equal predicted grids; they do not prove the latent state repeats, which
+    is why a cycle only counts when it is confirmed up to the last step.
+    """
+    P, S = correct.shape
+    unsolved_last = ~correct[:, -1]
+    rec = cycle_records(hashes[unsolved_last])
+    cls = classify_cycles(rec)
+    U = int(unsolved_last.sum())
+    confirmed = cls <= 1
+    steps = np.arange(1, S + 1)
+
+    # Per step: puzzles unsolved at that step that are already in their confirmed cycle
+    wrong = ~correct[unsolved_last]
+    in_cycle = confirmed[:, None] & (rec["first_repeat_step"][:, None] <= steps[None, :]) & wrong
+    by_step = []
+    for s in range(S):
+        n = int((~correct[:, s]).sum())
+        frozen, cycling = int(in_cycle[cls == 0, s].sum()), int(in_cycle[cls == 1, s].sum())
+        by_step.append({"step": s + 1, "unsolved": n, "unsolved_at_last": int(wrong[:, s].sum()),
+                        "in_frozen": frozen, "in_cycling": cycling,
+                        "share_in_confirmed_cycle": (frozen + cycling) / n if n else None})
+
+    step_counts = lambda v: np.bincount(v, minlength=S + 1)[1:].tolist()  # entry s - 1 is step s
+    repeats = rec["first_repeat_step"] > 0
+    return {
+        "num_unsolved_at_last": U,
+        "classes": {name: {"count": int((cls == i).sum()), "share": float((cls == i).mean()) if U else None}
+                    for i, name in enumerate(CYCLE_CLASSES)},
+        "repeats": {
+            "with_any_repeat": int(repeats.sum()),
+            "first_repeat_step_counts": step_counts(rec["first_repeat_step"][repeats]),
+            "first_repeat_period_counts": _value_counts(rec["period"][repeats]),
+            "distinct_grids_counts": step_counts(rec["distinct"]),  # entry d - 1: puzzles with d distinct grids
+        },
+        "confirmed": {
+            "period_counts": _value_counts(rec["period"][confirmed]),
+            "start_step_counts": step_counts(rec["first_repeat_step"][confirmed]),
+        },
+        # Not confirmed from the first repeat, but the last full period repeats: an early
+        # transient repeat followed by a cycle. Counted as revisiting above.
+        "revisiting_ending_periodic": int(((cls == 2) & rec["ends_periodic"]).sum()),
+        "by_step": by_step,
+    }
+
+
+def halt_step_counts(logits: np.ndarray, threshold: float) -> List[int]:
+    """Number of puzzles halting at each step (entry s - 1 is step s; the last entry includes
+    the puzzles that never reach the threshold)."""
+    return np.bincount(halting_steps(logits, threshold), minlength=logits.shape[1] + 1)[1:].tolist()
+
+
 def select_threshold(curve: HaltCurve, tolerance: float) -> dict:
     """Fewest average steps with accuracy >= full-step accuracy - tolerance (on curve's puzzles)."""
     thresholds = curve.level_thresholds()
@@ -344,7 +510,8 @@ def evaluate_with_ci(logits: np.ndarray, correct: np.ndarray, threshold: float,
     point = stats(counts)
     boot = stats(rng.multinomial(P, counts / P, size=num_resamples)) if num_resamples > 0 else None
     lo, hi = 100 * (1 - ci) / 2, 100 * (1 + ci) / 2
-    out = {"threshold": threshold, "frac_halted_early": float((h < S).mean())}
+    out = {"threshold": threshold, "frac_halted_early": float((h < S).mean()),
+           "halt_step_counts": np.bincount(h, minlength=S + 1)[1:].tolist()}
     for k, v in point.items():
         out[k] = float(v)
         if boot is not None:
@@ -394,6 +561,15 @@ def analyze_group(data: dict, rows: np.ndarray, selection: np.ndarray, tolerance
         result["unchanged_among_unsolved"] = unchanged_among_unsolved(c_rep, data["preds_changed"][rows][:, steps][rep])
     else:
         result["unchanged_among_unsolved"] = "not available: the capture has no preds_changed"
+    result["state_change_among_unsolved"] = {
+        z: state_change_among_unsolved(c_rep, data[f"{z}_rel_change"][rows][:, steps][rep])
+        if f"{z}_rel_change" in data else f"not available: the capture has no {z}_rel_change"
+        for z in ("z_H", "z_L")}
+    result["solving_rate"] = solving_rate(c_rep)
+    if "pred_hash" in data:
+        result["cycles"] = cycle_analysis(c_rep, data["pred_hash"][rows][:, steps][rep])
+    else:
+        result["cycles"] = "not available: the capture has no pred_hash"
     curves = {}
     for head, all_logits in data["logits"].items():
         logits = all_logits[rows][:, steps]
@@ -402,7 +578,9 @@ def analyze_group(data: dict, rows: np.ndarray, selection: np.ndarray, tolerance
         curves[head] = {"threshold": grid, **report_curve(grid)}
 
         t0 = report_curve(0.0)
-        head_result = {"t0": {k: float(v[0]) for k, v in t0.items()}, "operating_points": []}
+        head_result = {"t0": {**{k: float(v[0]) for k, v in t0.items()},
+                              "halt_step_counts": halt_step_counts(logits[rep], 0.0)},
+                       "operating_points": []}
         selection_curve = HaltCurve(logits[sel], correct[sel])
         for tol in tolerances:
             chosen = select_threshold(selection_curve, tol)
@@ -560,6 +738,10 @@ def print_summary(summary: dict, plots: List[str], out_dir: str):
         print(f"\n[{label}] report split: {r['num_report']} puzzles; full-step accuracy {r['full_step_accuracy']:.4f} "
               f"(all puzzles: {r['full_step_accuracy_all_puzzles']:.4f})")
         print(f"  oracle: accuracy {r['oracle']['accuracy']:.4f}, avg steps {r['oracle']['avg_steps']:.2f}")
+        cyc = r.get("cycles")
+        if isinstance(cyc, dict) and cyc["num_unsolved_at_last"]:
+            print(f"  unsolved at the last step: {cyc['num_unsolved_at_last']} -> " + ", ".join(
+                f"{name} {c['share']:.1%}" for name, c in cyc["classes"].items()))
         for head, h in r["heads"].items():
             t0 = h["t0"]
             print(f"  {head}: t=0 -> accuracy {t0['accuracy']:.4f}, avg steps {t0['avg_steps']:.2f}")

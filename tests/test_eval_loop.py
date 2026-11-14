@@ -1,6 +1,6 @@
 """Tests for evaluation-time step limit, frozen-mask halting and the extended per-step capture.
 
-Run with `python -m pytest tests/` or `python tests/test_eval_halting.py`.
+Run with `python -m pytest tests/` or `python tests/test_eval_loop.py`.
 """
 import os
 import sys
@@ -13,9 +13,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, ".."))
 sys.path.insert(0, HERE)
 
-from analysis import halt_curves as hc  # noqa: E402
-from utils.eval_halting import FrozenOutputs, run_eval_batch, halt_logit_key  # noqa: E402
+from analysis import eval_steps as es  # noqa: E402
+from utils.eval_loop import FrozenOutputs, run_eval_batch, halt_logit_key, grid_hash, grid_hash_coefficients  # noqa: E402
 from test_aux_halt_heads import make_model, make_batch, AUX, BATCH  # noqa: E402
+
+COEF_0 = -539115568831144627  # grid_hash_coefficients(1)[0]
 
 TRAIN_STEPS, EVAL_STEPS = 4, 8
 
@@ -60,7 +62,7 @@ def test_frozen_mask_matches_offline_rule():
     logits = torch.randint(-4, 5, (200, 7), generator=g).float() / 2  # many ties
     for t in [-1.0, 0.0, 0.5, 1.25]:
         frozen = _run_frozen(logits, t)
-        assert np.array_equal(frozen.halt_step.numpy(), hc.halting_steps(logits.numpy(), t))
+        assert np.array_equal(frozen.halt_step.numpy(), es.halting_steps(logits.numpy(), t))
 
 
 # ----------------------------------------------------------------------------- small evaluation run
@@ -181,16 +183,16 @@ def test_in_loop_halting_matches_offline_replay():
 
             with tempfile.TemporaryDirectory() as d:
                 save_capture(os.path.join(d, "step_1_eval_steps.0"), result, halt=(head, t))
-                data, checks = hc.load(d, 1)
+                data, checks = es.load(d, 1)
             correct = data["seq_is_correct"]
             assert correct.shape == (BATCH, EVAL_STEPS)  # all steps captured, whatever the halting
 
             # Offline replay of the capture at the same threshold
-            replay = hc.HaltCurve(data["logits"][head], correct)(float(np.float32(t)))
+            replay = es.HaltCurve(data["logits"][head], correct)(float(np.float32(t)))
             assert np.isclose(replay["accuracy"][0], int(m["exact_accuracy"]) / count)
             assert np.isclose(replay["avg_steps"][0], int(m["steps"]) / count)
             assert np.isclose(replay["frac_halted_early"][0], int(m["halted_early"]) / count)
-            assert np.array_equal(data["halt_step"], hc.halting_steps(data["logits"][head], float(np.float32(t))))
+            assert np.array_equal(data["halt_step"], es.halting_steps(data["logits"][head], float(np.float32(t))))
             assert checks["in_loop_halting"]["matches_replay"]
 
             # Frozen predictions are the ones of the halting step
@@ -214,7 +216,7 @@ def test_capture_change_records():
     expected = (all_preds[:, 1:] != all_preds[:, :-1]).any(-1)
     assert torch.equal(rec["preds_changed"][:, 1:], expected)
     for k in ["z_H_rel_change", "z_L_rel_change"]:
-        assert rec[k].shape == (BATCH, EVAL_STEPS) and rec[k].dtype == torch.float32
+        assert rec[k].shape == (BATCH, EVAL_STEPS) and rec[k].dtype == torch.float16
         assert rec[k][:, 0].isnan().all() and (rec[k][:, 1:] > 0).all() and rec[k][:, 1:].isfinite().all()
 
     # Reference value for z_H at step 2, from the carries
@@ -225,7 +227,37 @@ def test_capture_change_records():
         carry, *_ = model(carry=carry, batch=batch, return_keys=set())
         z2 = carry.inner_carry.z_H.float()
     ref = (z2 - z1).flatten(1).norm(dim=1) / z1.flatten(1).norm(dim=1)
-    assert torch.allclose(rec["z_H_rel_change"][:, 1], ref)
+    assert torch.allclose(rec["z_H_rel_change"][:, 1].float(), ref, rtol=2e-3)  # stored as float16
+
+    # Grid hash: equal at consecutive steps exactly when the grid did not change, and a pure
+    # function of the grid
+    assert rec["pred_hash"].dtype == torch.int64 and rec["pred_hash"].shape == (BATCH, EVAL_STEPS)
+    assert torch.equal(rec["pred_hash"][:, 1:] != rec["pred_hash"][:, :-1], expected)
+    assert torch.equal(rec["pred_hash"], torch.stack([grid_hash(all_preds[:, s]) for s in range(EVAL_STEPS)], 1))
+
+
+def test_grid_hash():
+    coef = grid_hash_coefficients(81)
+    assert coef == grid_hash_coefficients(81) and coef[:5] == grid_hash_coefficients(5)
+    assert all(c % 2 == 1 and -2 ** 63 <= c < 2 ** 63 for c in coef) and len(set(coef)) == 81
+    assert coef[0] == COEF_0  # fixed constant: hashes are comparable across runs and versions
+
+    state = torch.get_rng_state()
+    g = torch.Generator().manual_seed(0)
+    grids = torch.randint(0, 11, (500, 81), generator=g)
+    h = grid_hash(grids)
+    assert torch.equal(torch.get_rng_state(), state)  # the global generator is untouched
+    assert h.dtype == torch.int64 and h.unique().numel() == 500
+    assert torch.equal(h, grid_hash(grids.clone().to(torch.int32)))
+    # Wraparound arithmetic, checked against exact Python integers
+    exact = sum((int(t) + 1) * c for t, c in zip(grids[0], coef)) % 2 ** 64
+    assert int(h[0]) % 2 ** 64 == exact
+    # One changed cell, a swap of two cells, and an all-zero grid all change the hash
+    one = grids.clone(); one[:, 40] = (one[:, 40] + 1) % 11
+    swap = grids.clone(); swap[:, [3, 4]] = swap[:, [4, 3]]
+    assert (grid_hash(one) != h).all()
+    assert torch.equal(grid_hash(swap) != h, grids[:, 3] != grids[:, 4])
+    assert int(grid_hash(torch.zeros(1, 81, dtype=torch.long))) != 0
 
 
 def test_unknown_halt_head():
