@@ -708,27 +708,68 @@ def plot_solving_rate_by_distance(runs: List[Run], log_y: bool = True):
 
 VARIANT_COLORS = {"continue": MUTED, "perturb": "#2a78d6", "noisy_restart": "#eb6834"}
 PLAIN_COLOR = INK
+Restarts = Optional[Dict[str, dict]]
 
 
-def load_restarts(directory: Optional[str], root: str = ".") -> Optional[dict]:
-    """summary.json of an experiments/restarts.py run, or None (with a note)."""
-    if directory is None:
-        print("[restarts] skipped: RESTARTS_DIR is not set")
+def load_restarts(spec, root: str = ".") -> Restarts:
+    """summary.json of experiments/restarts.py runs.
+
+    spec: {label: run directory} (e.g. one per checkpoint, shown side by side in this order), or one
+    directory. Returns {label: summary} for the runs found, or None; prints a note for the others."""
+    if not spec:
+        print("[restarts] skipped: RESTARTS is not set")
         return None
-    path = os.path.join(root, directory, "summary.json")
-    if not os.path.exists(path):
-        print(f"[restarts] skipped: {path} not found (run experiments/restarts.py, or its summarize command)")
-        return None
-    with open(path) as f:
-        summary = json.load(f)
-    if not summary["split"]["retried_report_puzzles"]:
-        print("[restarts] skipped: no puzzle was retried")
-        return None
-    return summary
+    if isinstance(spec, (str, os.PathLike)):
+        spec = {os.path.basename(os.path.normpath(spec)): spec}
+    out = {}
+    for label, directory in spec.items():
+        path = os.path.join(root, directory, "summary.json")
+        if not os.path.exists(path):
+            print(f"[restarts: {label}] skipped: {path} not found (run experiments/restarts.py, or its summarize command)")
+            continue
+        with open(path) as f:
+            summary = json.load(f)
+        if not summary["split"]["retried_report_puzzles"]:
+            print(f"[restarts: {label}] skipped: no puzzle was retried")
+            continue
+        out[label] = summary
+    return out or None
 
 
-def _label(variant: str, scale) -> str:
-    return "control (continue)" if variant == "continue" else f"{variant.replace('_', ' ')} {scale:g}"
+def _checkpoints(restarts) -> List[Tuple[str, dict]]:
+    """[(label, summary)] from load_restarts' result; a single summary is also accepted."""
+    if not restarts:
+        return []
+    if "split" in restarts:
+        return [("", restarts)]
+    return list(restarts.items())
+
+
+def _label(variant: str, scale, entry: Optional[dict] = None) -> str:
+    """'control (continue)', 'noisy restart 0.1', with ', 8 x 4 steps' for a group with attempts."""
+    if variant == "continue":
+        return "control (continue)"
+    text = f"{variant.replace('_', ' ')} {scale:g}"
+    if entry and "attempts" in entry:
+        text += f", {entry['attempts']} x {entry['attempt_steps']} steps"
+    return text
+
+
+def _group_key(g: dict) -> tuple:
+    return g["variant"], g["scale"], g.get("attempt_steps")
+
+
+def _group_colors(restarts) -> Dict[tuple, str]:
+    """One color per restart setting, the same for every checkpoint (in order of first appearance)."""
+    keys = list(dict.fromkeys(_group_key(g) for _, s in _checkpoints(restarts) for g in s["groups"]))
+    return {k: RUN_COLORS[i % len(RUN_COLORS)] for i, k in enumerate(keys)}
+
+
+def _members(summary: dict, g: dict) -> List[dict]:
+    names = g.get("branches")
+    if names is not None:
+        return [b for b in summary["branches"] if b["branch"] in names]
+    return [b for b in summary["branches"] if (b["variant"], b["scale"]) == (g["variant"], g["scale"])]
 
 
 def _rng_text(stat: dict, digits: int = 4, signed: bool = False) -> str:
@@ -736,143 +777,291 @@ def _rng_text(stat: dict, digits: int = 4, signed: bool = False) -> str:
     return f"{f.format(stat['mean'])} [{f.format(stat['min'])}, {f.format(stat['max'])}]"
 
 
-def restarts_table(summary: Optional[dict]) -> Optional[Table]:
-    """Per variant and scale, over the retried puzzles: results across seeds, the sequential
-    (deployable) strategy, and the any-seed oracle."""
-    if summary is None:
+def _diff_text(p: Optional[dict]) -> str:
+    if p is None:
+        return "-"
+    ci = p.get("difference_ci")
+    return f"{p['difference']:+.4f}" + (f" [{ci[0]:+.4f}, {ci[1]:+.4f}]" if ci else "")
+
+
+def _models_caption(restarts) -> str:
+    parts = []
+    for label, s in _checkpoints(restarts):
+        sp = s["settings"]
+        parts.append(f"{label + ': ' if label else ''}{s['split']['retried_report_puzzles']:,} retried puzzles "
+                     f"(not accepted by {sp['head']} at threshold {sp['threshold']:g} by step {sp['n1']}; "
+                     f"control: {sp['n2']} more steps)")
+    return "; ".join(parts) + "."
+
+
+def restarts_sequential_table(restarts: Restarts) -> Optional[Table]:
+    """Per checkpoint and restart setting, over the retried puzzles of the report split: the
+    sequential strategy against the control (paired, same puzzles)."""
+    if not restarts:
         return None
-    ctrl = next(b for b in summary["branches"] if b["variant"] == "continue")
-    rows = [[_label("continue", 0), "-", f"{ctrl['solved_share']:.4f}", "-", f"{ctrl['false_acceptances']:,}",
-             f"{ctrl['mean_steps']:.2f}", "-", "-", "-", "-", f"{ctrl['overall']['accuracy']:.4f} @ {ctrl['overall']['avg_steps']:.2f}"]]
-    for g in summary["groups"]:
-        a, s = g["across_seeds"], g["sequential"]
-        realized = [b["realized_scale_z_H"] for b in summary["branches"] if (b["variant"], b["scale"]) == (g["variant"], g["scale"])]
-        plain = s.get("paired_with_plain_same_budget")
-        rows.append([_label(g["variant"], g["scale"]), f"{np.mean(realized):.4g}", _rng_text(a["solved_share"]),
-                     _rng_text(g["difference_from_control"], signed=True), _rng_text(a["false_acceptances"], 0),
-                     _rng_text(a["mean_steps"], 2), f"{s['solved_share']:.4f} ({s['false_acceptances']:,} false)",
-                     f"{s['mean_steps']:.2f}",
-                     "-" if plain is None else f"{plain['difference']:+.4f} [{plain['difference_ci'][0]:+.4f}, {plain['difference_ci'][1]:+.4f}]"
-                     if "difference_ci" in plain else f"{plain['difference']:+.4f}",
-                     f"{g['any_seed_oracle']['solved_share']:.4f}",
-                     f"{s['overall']['accuracy']:.4f} @ {s['overall']['avg_steps']:.2f}"])
-    n, sp = summary["split"]["retried_report_puzzles"], summary["settings"]
-    return Table(["variant", "realized noise (z_H)", "solved share: mean [min, max] over seeds", "vs control",
+    rows = []
+    for label, s in _checkpoints(restarts):
+        n = s["split"]["retried_report_puzzles"]
+        ctrl = next(b for b in s["branches"] if b["variant"] == "continue")
+        rows.append([label, _label("continue", 0), f"{s['settings']['n1'] + s['settings']['n2']}", f"{ctrl['solved_share']:.4f}",
+                     f"{ctrl['false_acceptances']:,} ({ctrl['false_acceptances'] / n:.4f})", f"{ctrl['mean_steps']:.2f}", "-", "-"])
+        for g in s["groups"]:
+            q = g["sequential"]
+            rows.append([label, _label(g["variant"], g["scale"], g), f"{g.get('budget', '-')}", f"{q['solved_share']:.4f}",
+                         f"{q['false_acceptances']:,} ({q['false_acceptances'] / n:.4f})", f"{q['mean_steps']:.2f}",
+                         _diff_text(q["paired_with_control"]), " / ".join(map(str, q["attempts_used"]))])
+    return Table(["model", "strategy", "max steps", "solved", "false acceptances", "mean steps", "vs control [95% interval]",
+                  "puzzles answered by attempt 1 / 2 / ..."], rows,
+                 _models_caption(restarts) + " Sequential: attempts in seed order, the first answer the head accepts is "
+                 "kept (otherwise the last attempt's), every attempt's steps counted; deployable, no ground truth. Steps "
+                 "count from the start (phase 1 included). Interval: bootstrap over puzzles.")
+
+
+def restarts_table(restarts: Restarts) -> Optional[Table]:
+    """Per checkpoint, variant and scale, over the retried puzzles: results across seeds, the
+    sequential (deployable) strategy, and the any-seed oracle."""
+    if not restarts:
+        return None
+    rows = []
+    for label, summary in _checkpoints(restarts):
+        ctrl = next(b for b in summary["branches"] if b["variant"] == "continue")
+        rows.append([label, _label("continue", 0), "-", f"{ctrl['solved_share']:.4f}", "-", f"{ctrl['false_acceptances']:,}",
+                     f"{ctrl['mean_steps']:.2f}", "-", "-", "-", "-", f"{ctrl['overall']['accuracy']:.4f} @ {ctrl['overall']['avg_steps']:.2f}"])
+        for g in summary["groups"]:
+            a, s = g["across_seeds"], g["sequential"]
+            realized = [b["realized_scale_z_H"] for b in _members(summary, g)]
+            rows.append([label, _label(g["variant"], g["scale"], g), f"{np.mean(realized):.4g}", _rng_text(a["solved_share"]),
+                         _rng_text(g["difference_from_control"], signed=True), _rng_text(a["false_acceptances"], 0),
+                         _rng_text(a["mean_steps"], 2), f"{s['solved_share']:.4f} ({s['false_acceptances']:,} false)",
+                         f"{s['mean_steps']:.2f}", _diff_text(s.get("paired_with_plain_same_budget")),
+                         f"{g['any_seed_oracle']['solved_share']:.4f}",
+                         f"{s['overall']['accuracy']:.4f} @ {s['overall']['avg_steps']:.2f}"])
+    return Table(["model", "variant", "realized noise (z_H)", "one attempt solves: mean [min, max] over seeds", "vs control",
                   "false acceptances", "mean steps", "sequential: solved", "sequential: mean steps",
                   "sequential vs plain, same budget", "any seed (oracle)", "overall: accuracy @ avg steps"], rows,
-                 f"{n:,} retried puzzles of the report split (not accepted by {sp['head']} at threshold {sp['threshold']:g} "
-                 f"by step {sp['n1']}); each attempt has {sp['n2']} more steps. Sequential: seeds in order, first accepted "
-                 "answer kept, every attempt's steps counted (deployable). Any seed (oracle): picks the seed with ground "
-                 "truth, several times the budget; an upper bound only. Overall: phase 1 plus phase 2, all report puzzles "
-                 "(sequential overall uses the sequential strategy).")
+                 _models_caption(restarts) + " Sequential: seeds in order, first accepted answer kept, every attempt's "
+                 "steps counted (deployable). Any seed (oracle): picks the seed with ground truth; an upper bound only. "
+                 "Overall: phase 1 plus phase 2, all report puzzles (sequential overall uses the sequential strategy).")
 
 
-def restarts_paired_table(summary: Optional[dict]) -> Optional[Table]:
+def restarts_paired_table(restarts: Restarts) -> Optional[Table]:
     """Paired comparison with the control on the same retried puzzles, per seed and for the sequential strategy."""
-    if summary is None:
+    if not restarts:
         return None
     rows = []
 
-    def add(name, p):
-        ci = p.get("difference_ci")
-        rows.append([name, f"{p['both']:,}", f"{p['variant_only']:,}", f"{p['control_only']:,}", f"{p['neither']:,}",
-                     f"{p['difference']:+.4f}" + (f" [{ci[0]:+.4f}, {ci[1]:+.4f}]" if ci else "")])
+    def add(label, name, p):
+        rows.append([label, name, f"{p['both']:,}", f"{p['variant_only']:,}", f"{p['control_only']:,}", f"{p['neither']:,}",
+                     _diff_text(p)])
 
-    for b in summary["branches"]:
-        if b["variant"] != "continue":
-            add(f"{_label(b['variant'], b['scale'])}, seed {b['seed']}", b["paired_with_control"])
-    for g in summary["groups"]:
-        add(f"{_label(g['variant'], g['scale'])}, sequential", g["sequential"]["paired_with_control"])
-    return Table(["variant", "solved by both", "variant only", "control only", "neither", "difference [95% interval]"],
+    for label, summary in _checkpoints(restarts):
+        for g in summary["groups"]:
+            for b in _members(summary, g):
+                add(label, f"{_label(g['variant'], g['scale'], g)}, seed {b['seed']}", b["paired_with_control"])
+            add(label, f"{_label(g['variant'], g['scale'], g)}, sequential", g["sequential"]["paired_with_control"])
+    return Table(["model", "variant", "solved by both", "variant only", "control only", "neither", "difference [95% interval]"],
                  rows, "Retried puzzles of the report split. Interval: bootstrap over puzzles. Many puzzles changing "
                        "sides with a difference near 0 means the noise re-rolls which puzzles are solved, not how many.")
 
 
-def plot_restarts_solved(summary: Optional[dict]):
-    """Share of retried puzzles solved, and false acceptances, per variant and scale."""
-    if summary is None:
+def _pct_list(counts: List[int], start: int) -> str:
+    total = sum(counts)
+    return " · ".join(f"{start + i}: {c / total:.0%}" for i, c in enumerate(counts) if c) if total else "-"
+
+
+def restarts_diversity_table(restarts: Restarts) -> Optional[Table]:
+    """Per checkpoint and setting: how many distinct grids a puzzle's attempts end on, and how
+    often an attempt ends on the grid the same steps give without noise."""
+    if not restarts:
+        return None
+    rows = []
+    for label, s in _checkpoints(restarts):
+        for g in s["groups"]:
+            d = g.get("diversity")
+            if d is None:
+                print(f"[restarts: {label}] {_label(g['variant'], g['scale'], g)}: no grid hashes in this run (rerun restarts.py)")
+                continue
+            same = d.get("same_as_unperturbed")
+            rows.append([label, _label(g["variant"], g["scale"], g), f"{d['attempts']}",
+                         f"{d['distinct_final_grids']['mean']:.2f}", _pct_list(d["distinct_final_grids"]["counts"], 1),
+                         "-" if same is None else f"{same['share_of_attempts']:.4f}",
+                         "-" if same is None else _pct_list(same["counts"], 0)])
+    if not rows:
+        return None
+    return Table(["model", "setting", "attempts", "distinct final grids: mean", "puzzles by distinct final grids",
+                  "attempts ending on the unperturbed grid", "puzzles by such attempts"], rows,
+                 "Retried puzzles of the report split. Final grid: the grid at an attempt's last step (from the grid "
+                 "hashes). Unperturbed grid: for a noisy restart of A steps, the plain run's grid at step A (the same "
+                 "steps from the initial state, without noise); for a perturbation, the control's grid at step N1 + A.")
+
+
+def plot_restarts_solved(restarts: Restarts):
+    """Share of retried puzzles solved, and false acceptances, per variant and scale (one row per checkpoint)."""
+    models = _checkpoints(restarts)
+    if not models:
         return None
     from matplotlib.lines import Line2D
     plt = _plt()
-    n = summary["split"]["retried_report_puzzles"]
-    ctrl = next(b for b in summary["branches"] if b["variant"] == "continue")
-    groups = summary["groups"]
-    fig, (ax, ax_false) = plt.subplots(1, 2, figsize=(14, 4.8))
-    labels = [_label("continue", 0)] + [_label(g["variant"], g["scale"]) for g in groups]
-    for axis, key, scale in ((ax, "solved", 1 / n), (ax_false, "false_acceptances", 1 / n)):
-        axis.scatter([0], [ctrl[key] * scale], s=60, color=VARIANT_COLORS["continue"], zorder=3)
-        axis.axhline(ctrl[key] * scale, color=VARIANT_COLORS["continue"], linestyle="--", linewidth=1)
-        for x, g in enumerate(groups, start=1):
-            color = VARIANT_COLORS.get(g["variant"], MUTED)
-            seeds = [b for b in summary["branches"] if (b["variant"], b["scale"]) == (g["variant"], g["scale"])]
-            ys = [b[key] * scale for b in seeds]
-            axis.scatter([x - 0.12] * len(ys), ys, s=22, color=color, alpha=0.8, zorder=3)
-            axis.plot([x - 0.22, x - 0.02], [np.mean(ys)] * 2, color=color, linewidth=2.5)
-            axis.scatter([x + 0.15], [g["sequential"][key] * scale], s=70, facecolor="white", edgecolor=color,
-                         linewidth=1.8, marker="D", zorder=4)
-            if key == "solved":
-                axis.scatter([x + 0.15], [g["any_seed_oracle"]["solved_share"]], s=45, color=MUTED, marker="x", zorder=4)
-        axis.set_xticks(range(len(labels)), labels, rotation=30, ha="right")
-        axis.set_xlim(-0.6, len(labels) - 0.4)
-        axis.grid(axis="x", visible=False)
-    _style(ax, "", "share of the retried puzzles solved", f"Retried puzzles solved ({n:,} puzzles, report split)")
-    _style(ax_false, "", "share of the retried puzzles", "False acceptances (accepted but wrong)")
-    handles = [Line2D([], [], color=MUTED, marker="o", linestyle="none", markersize=5, label="one seed"),
+    fig, axes = plt.subplots(len(models), 2, figsize=(14, 5.2 * len(models)), squeeze=False)
+    for (label, summary), (ax, ax_false) in zip(models, axes):
+        n = summary["split"]["retried_report_puzzles"]
+        ctrl = next(b for b in summary["branches"] if b["variant"] == "continue")
+        groups = summary["groups"]
+        labels = [_label("continue", 0)] + [_label(g["variant"], g["scale"], g) for g in groups]
+        for axis, key in ((ax, "solved"), (ax_false, "false_acceptances")):
+            axis.scatter([0], [ctrl[key] / n], s=60, color=VARIANT_COLORS["continue"], zorder=3)
+            axis.axhline(ctrl[key] / n, color=VARIANT_COLORS["continue"], linestyle="--", linewidth=1)
+            for x, g in enumerate(groups, start=1):
+                color = VARIANT_COLORS.get(g["variant"], MUTED)
+                ys = [b[key] / n for b in _members(summary, g)]
+                axis.scatter([x - 0.12] * len(ys), ys, s=22, color=color, alpha=0.8, zorder=3)
+                axis.plot([x - 0.22, x - 0.02], [np.mean(ys)] * 2, color=color, linewidth=2.5)
+                axis.scatter([x + 0.15], [g["sequential"][key] / n], s=70, facecolor="white", edgecolor=color,
+                             linewidth=1.8, marker="D", zorder=4)
+                if key == "solved":
+                    axis.scatter([x + 0.15], [g["any_seed_oracle"]["solved_share"]], s=45, color=MUTED, marker="x", zorder=4)
+            axis.set_xticks(range(len(labels)), labels, rotation=30, ha="right")
+            axis.set_xlim(-0.6, len(labels) - 0.4)
+            axis.grid(axis="x", visible=False)
+        ax_false.set_ylim(0, max(ax_false.get_ylim()[1], 0.01))
+        prefix = f"{label}: " if label else ""
+        _style(ax, "", "share of the retried puzzles solved", f"{prefix}retried puzzles solved ({n:,} puzzles, report split)")
+        _style(ax_false, "", "share of the retried puzzles", f"{prefix}false acceptances (accepted but wrong)")
+    handles = [Line2D([], [], color=MUTED, marker="o", linestyle="none", markersize=5, label="one attempt (seed)"),
                Line2D([], [], color=MUTED, linewidth=2.5, label="mean over seeds"),
                Line2D([], [], color=MUTED, marker="D", markerfacecolor="white", linestyle="none", markersize=7,
                       label="sequential (deployable, several attempts)"),
                Line2D([], [], color=MUTED, marker="x", linestyle="none", markersize=7, label="any seed (oracle, upper bound)"),
                Line2D([], [], color=MUTED, linestyle="--", label="control")]
-    _legend(ax, handles, loc="best")
+    _legend(axes[0][0], handles, loc="best")
     fig.tight_layout()
     return fig
 
 
-def plot_restarts_overall(summary: Optional[dict]):
-    """Whole procedure (phase 1 + phase 2) on the report split: accuracy against average steps, with
-    plain continuation to the same budgets and fixed step counts as references."""
-    if summary is None:
+def plot_restarts_solving_rate(restarts: Restarts):
+    """Solving rate per step after the branch point, one panel per checkpoint: the control at steps
+    N1 + 1 ..., each restart setting by step within the attempt, pooled over its attempts."""
+    models = _checkpoints(restarts)
+    if not models:
         return None
     from matplotlib.lines import Line2D
     plt = _plt()
-    fig, ax = plt.subplots(figsize=(10, 5.6))
-    p1 = summary["phase1"]["overall_stop_at_n1"]
-    ax.scatter([p1["avg_steps"]], [p1["accuracy"]], marker="s", s=60, color=MUTED, zorder=4)
-    ax.annotate(f"stop at step {summary['settings']['n1']}", (p1["avg_steps"], p1["accuracy"]), textcoords="offset points",
-                xytext=(6, -12), fontsize=8, color=INK)
-    for b in summary["branches"]:
-        color = VARIANT_COLORS.get(b["variant"], MUTED)
-        ax.scatter([b["overall"]["avg_steps"]], [b["overall"]["accuracy"]], s=60 if b["variant"] == "continue" else 18,
-                   color=color, alpha=1 if b["variant"] == "continue" else 0.7, zorder=3)
-    for g in summary["groups"]:
-        s = g["sequential"]["overall"]
-        color = VARIANT_COLORS.get(g["variant"], MUTED)
-        ax.scatter([s["avg_steps"]], [s["accuracy"]], marker="D", s=70, facecolor="white", edgecolor=color, linewidth=1.8, zorder=5)
-        ax.annotate(f"{g['scale']:g}", (s["avg_steps"], s["accuracy"]), textcoords="offset points", xytext=(6, 2),
-                    fontsize=8, color=INK)
-    ref = summary.get("reference")
-    if ref:
-        plain = ref["plain_continuation"]
-        xs, ys = [p["overall"]["avg_steps"] for p in plain], [p["overall"]["accuracy"] for p in plain]
-        ax.plot(xs, ys, "-o", color=PLAIN_COLOR, linewidth=1.5, markersize=6, zorder=4)
-        for p in plain:
-            ax.annotate(f"plain, halting within {p['budget']}", (p["overall"]["avg_steps"], p["overall"]["accuracy"]),
-                        textcoords="offset points", xytext=(6, -12), fontsize=8, color=INK)
-        for f in ref["fixed_steps"]:
-            ax.axhline(f["accuracy"], color=PLAIN_COLOR, linestyle=":", linewidth=1)
-            ax.annotate(f"{f['steps']} steps, no halting: {f['accuracy']:.4f}", (0.0, f["accuracy"]), xycoords=("axes fraction", "data"),
-                        textcoords="offset points", xytext=(4, 3), ha="left", fontsize=8, color=MUTED)
-    else:
-        print("[restarts] no plain reference points: summarize with --reference DIR STEP (a plain capture)")
-    _style(ax, "average steps per puzzle", "accuracy (all cells correct)",
-           f"Whole procedure on the report split ({summary['split']['report_puzzles']:,} puzzles)")
-    handles = [Line2D([], [], color=VARIANT_COLORS[v], marker="o", linestyle="none", markersize=6, label=_label(v, 0).split(" 0")[0])
-               for v in ("continue", "perturb", "noisy_restart")]
+    colors = _group_colors(restarts)
+    fig, axes = plt.subplots(1, len(models), figsize=(8 * len(models), 4.8), squeeze=False, sharey=True)
+    drawn = {}
+    for (label, s), ax in zip(models, axes[0]):
+        n1 = s["settings"]["n1"]
+        series = [("control", MUTED, s.get("control_solving_rate"))]
+        series += [(_label(g["variant"], g["scale"], g), colors[_group_key(g)], g.get("solving_rate")) for g in s["groups"]]
+        for name, color, entries in series:
+            if entries is None:
+                print(f"[restarts: {label}] {name}: no per-step solving rate in this summary (rerun summarize)")
+                continue
+            pts = [(e["step_in_branch"], e["rate"], e.get("rate_ci") or e.get("rate_ci_approx")) for e in entries if e["rate"]]
+            if not pts:
+                continue
+            x, y = np.array([p[0] for p in pts]), np.array([p[1] for p in pts])
+            lo, hi = np.array([p[2][0] for p in pts]), np.array([p[2][1] for p in pts])
+            ax.fill_between(x, np.maximum(lo, y * 1e-3), hi, color=color, alpha=0.15, linewidth=0)
+            ax.plot(x, y, "-o", color=color, linewidth=2, markersize=3.5)
+            drawn[name] = color
+        _plain_log(ax)
+        from matplotlib.ticker import MaxNLocator
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+        _style(ax, f"steps after step {n1} (control: step {n1} + k; restarts: step k of the attempt)",
+               "solving rate (of those wrong at the previous step)",
+               f"{label + ': ' if label else ''}solving rate per step")
+    handles = [Line2D([], [], color=c, linewidth=2, marker="o", markersize=3.5, label=k) for k, c in drawn.items()]
+    _legend(axes[0][-1], handles, loc="best")
+    fig.text(0.01, -0.02, "Bands: 95% Wilson intervals (approximate when pooled over attempts of the same puzzles). "
+                          "Before step 1 of an attempt, the puzzle's grid at step N1 counts as the previous step.",
+             fontsize=8, color=MUTED)
+    fig.tight_layout()
+    return fig
+
+
+def plot_restarts_diversity(restarts: Restarts):
+    """Share of retried puzzles by number of distinct final grids over their attempts, one panel per checkpoint."""
+    models = _checkpoints(restarts)
+    if not models or not any(g.get("diversity") for _, s in models for g in s["groups"]):
+        print("[restarts] diversity skipped: no grid hashes in these runs")
+        return None
+    from matplotlib.patches import Patch
+    plt = _plt()
+    colors = _group_colors(restarts)
+    fig, axes = plt.subplots(1, len(models), figsize=(8 * len(models), 4.6), squeeze=False, sharey=True)
+    drawn = {}
+    for (label, s), ax in zip(models, axes[0]):
+        groups = [g for g in s["groups"] if g.get("diversity")]
+        width = 0.8 / max(len(groups), 1)
+        k_max = max((g["diversity"]["attempts"] for g in groups), default=1)
+        for i, g in enumerate(groups):
+            counts = np.array(g["diversity"]["distinct_final_grids"]["counts"], dtype=float)
+            x = np.arange(1, len(counts) + 1) - 0.4 + width * (i + 0.5)
+            name, color = _label(g["variant"], g["scale"], g), colors[_group_key(g)]
+            ax.bar(x, counts / counts.sum(), width=width * 0.9, color=color, linewidth=0)
+            drawn[name] = color
+        ax.set_xticks(range(1, k_max + 1))
+        ax.grid(axis="x", visible=False)
+        _style(ax, "distinct final grids over the attempts", "share of the retried puzzles",
+               f"{label + ': ' if label else ''}how different are the attempts' final grids?")
+    _legend(axes[0][-1], [Patch(color=c, label=k) for k, c in drawn.items()], loc="best")
+    fig.tight_layout()
+    return fig
+
+
+def plot_restarts_overall(restarts: Restarts):
+    """Whole procedure (phase 1 + phase 2) on the report split, one panel per checkpoint: accuracy
+    against average steps, with plain continuation to the same budgets and fixed step counts."""
+    models = _checkpoints(restarts)
+    if not models:
+        return None
+    from matplotlib.lines import Line2D
+    plt = _plt()
+    fig, axes = plt.subplots(1, len(models), figsize=(9 * len(models), 5.6), squeeze=False)
+    any_ref = False
+    for (label, summary), ax in zip(models, axes[0]):
+        p1 = summary["phase1"]["overall_stop_at_n1"]
+        ax.scatter([p1["avg_steps"]], [p1["accuracy"]], marker="s", s=60, color=MUTED, zorder=4)
+        ax.annotate(f"stop at step {summary['settings']['n1']}", (p1["avg_steps"], p1["accuracy"]), textcoords="offset points",
+                    xytext=(6, -12), fontsize=8, color=INK)
+        for b in summary["branches"]:
+            color = VARIANT_COLORS.get(b["variant"], MUTED)
+            ax.scatter([b["overall"]["avg_steps"]], [b["overall"]["accuracy"]], s=60 if b["variant"] == "continue" else 18,
+                       color=color, alpha=1 if b["variant"] == "continue" else 0.7, zorder=3)
+        for g in summary["groups"]:
+            s = g["sequential"]["overall"]
+            color = VARIANT_COLORS.get(g["variant"], MUTED)
+            ax.scatter([s["avg_steps"]], [s["accuracy"]], marker="D", s=70, facecolor="white", edgecolor=color, linewidth=1.8, zorder=5)
+            text = f"{g['scale']:g}" + (f", {g['attempts']}x{g['attempt_steps']}" if "attempts" in g else "")
+            ax.annotate(text, (s["avg_steps"], s["accuracy"]), textcoords="offset points", xytext=(6, 2), fontsize=8, color=INK)
+        ref = summary.get("reference")
+        if ref and ref.get("plain_continuation"):
+            any_ref = True
+            plain = ref["plain_continuation"]
+            xs, ys = [p["overall"]["avg_steps"] for p in plain], [p["overall"]["accuracy"] for p in plain]
+            ax.plot(xs, ys, "-o", color=PLAIN_COLOR, linewidth=1.5, markersize=6, zorder=4)
+            for p in plain:
+                ax.annotate(f"plain, halting within {p['budget']}", (p["overall"]["avg_steps"], p["overall"]["accuracy"]),
+                            textcoords="offset points", xytext=(6, -12), fontsize=8, color=INK)
+            for f in ref["fixed_steps"]:
+                ax.axhline(f["accuracy"], color=PLAIN_COLOR, linestyle=":", linewidth=1)
+                ax.annotate(f"{f['steps']} steps, no halting: {f['accuracy']:.4f}", (0.0, f["accuracy"]),
+                            xycoords=("axes fraction", "data"), textcoords="offset points", xytext=(4, 3), ha="left",
+                            fontsize=8, color=MUTED)
+        else:
+            print(f"[restarts{': ' + label if label else ''}] no plain reference points: summarize with --reference DIR STEP "
+                  "(a plain capture with more than N1 steps)")
+        _style(ax, "average steps per puzzle", "accuracy (all cells correct)",
+               f"{label + ': ' if label else ''}whole procedure on the report split ({summary['split']['report_puzzles']:,} puzzles)")
+    variants = list(dict.fromkeys(b["variant"] for _, s in models for b in s["branches"]))
+    handles = [Line2D([], [], color=VARIANT_COLORS.get(v, MUTED), marker="o", linestyle="none", markersize=6,
+                      label=_label(v, 0).split(" 0")[0]) for v in variants]
     handles += [Line2D([], [], color=MUTED, marker="D", markerfacecolor="white", linestyle="none", markersize=7,
-                       label="sequential (label: noise scale)"),
+                       label="sequential (label: noise scale, attempts x steps)"),
                 Line2D([], [], color=MUTED, marker="s", linestyle="none", markersize=6, label="phase 1 only")]
-    if ref:
+    if any_ref:
         handles.append(Line2D([], [], color=PLAIN_COLOR, marker="o", label="plain continuation, same budgets"))
-    _legend(ax, handles, loc="lower right")
+    _legend(axes[0][-1], handles, loc="lower right")
     fig.tight_layout()
     return fig

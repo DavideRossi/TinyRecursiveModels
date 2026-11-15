@@ -307,11 +307,27 @@ OUT=checkpoints/Sudoku-extreme-1k-aug-1000-ACT-torch/<run>_restarts SIF=/scratch
 
 | Option | Effect |
 |---|---|
-| `--max-puzzles 5000` | Only the first 5000 test puzzles (quick trials). |
-| `--n1 32 --n2 32` | Phase-1 steps and extra steps per attempt (defaults). |
-| `--head q_head --threshold 5.27` | The halting rule, in both phases (defaults). |
-| `--perturb-scales ... --restart-scales ... --seeds ...` | Noise scales of each variant and seeds (defaults 0.001 0.1 0.3 1.0; 0.1 0.3 1.0; 0 1 2). |
-| `--reference DIR STEP` | A plain capture of the same checkpoint with at least N1 + N2 steps. The summary checks phase 1 and the control against it and adds plain continuation to the same budgets. |
+| `--max-puzzles 50000 [--sample-seed 0]` | A random sample of that many test puzzles, drawn with the seed: the same puzzles for every checkpoint. |
+| `--n1 32 --n2 32` | Phase-1 steps and the control's extra steps (defaults). |
+| `--head q_head --threshold 5.27` | The halting rule, in both phases. Use each model's own threshold (e.g. the zero-tolerance one of its analysis `summary.json`). |
+| `--perturb-scales ... --restart-scales ... --seeds ...` | Noise scales of each variant and seeds (defaults 0.001 0.1 0.3 1.0; 0.1 0.3 1.0; 0 1 2). `--perturb-scales` with no value: no perturb variant. |
+| `--attempt-steps 4 8` | Short attempts instead of one attempt of N2 steps per seed: for each length A, N2 / A attempts (seeds 0 … N2/A − 1) per scale, together the control's budget. Not with `--seeds`. |
+| `--reference DIR STEP` | A plain capture of the same checkpoint with at least N1 steps. The summary checks phase 1 against it; with N1 + N2 steps or more also the control, and adds plain continuation to the budgets it covers. |
+
+Short noisy restarts against continuation at equal budget, on two models, with
+the same 50,000 puzzles (about 1 h each):
+
+```bash
+P=checkpoints/Sudoku-extreme-1k-aug-1000-ACT-torch
+export SIF=/scratch.hpc/$USER/trm-modern.sif
+SHORT="--n2 32 --attempt-steps 4 8 --perturb-scales --restart-scales 0.1 0.3 --max-puzzles 50000"
+CKPT=$P/sudoku_aux_linear/step_65100 OUT=$P/sudoku_aux_linear_restarts_short \
+  sbatch --time=03:00:00 slurm/restarts_sudoku.sbatch $SHORT --threshold 5.265625 \
+  --reference $P/sudoku_aux_linear_eval128 65100
+CKPT=$P/sudoku_aux_linear_hms4/step_65100 OUT=$P/sudoku_aux_linear_hms4_restarts_short \
+  sbatch --time=03:00:00 slurm/restarts_sudoku.sbatch $SHORT --threshold 7.046875 \
+  --reference $P/sudoku_aux_linear_hms4_eval32 65100
+```
 
 The summary can be recomputed anywhere (no GPU), e.g. on a laptop after
 copying the output directory (about 0.7 GB, most of it the per-branch captures

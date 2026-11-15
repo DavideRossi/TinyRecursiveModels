@@ -22,7 +22,7 @@ matplotlib.use("Agg")
 from analysis import eval_steps as es  # noqa: E402
 from analysis import report  # noqa: E402
 from test_eval_steps import _write_rank  # noqa: E402
-from test_restarts import write_known_run  # noqa: E402
+from test_restarts import write_known_run, write_short_run  # noqa: E402
 from experiments import restarts as rs  # noqa: E402
 
 NOTEBOOK = os.path.join(ROOT, "analysis", "report.ipynb")
@@ -224,30 +224,66 @@ def make_restarts(d, with_reference=True):
     return d
 
 
+RESTART_VIEWS = ("restarts_sequential_table", "restarts_table", "restarts_paired_table", "restarts_diversity_table",
+                 "plot_restarts_solved", "plot_restarts_solving_rate", "plot_restarts_diversity", "plot_restarts_overall")
+
+
 def test_restart_views():
     with tempfile.TemporaryDirectory() as d:
         summary = report.load_restarts(make_restarts(os.path.join(d, "r")))
+        assert list(summary) == ["r"]  # one directory: labelled by its name
         table = report.restarts_table(summary)
-        assert len(table.rows) == 2 and table.rows[0][0] == "control (continue)"
-        assert table.rows[1][2] == "0.4000 [0.4000, 0.4000]" and table.rows[1][9] == "0.6000"  # any seed: 3 of 5
+        assert len(table.rows) == 2 and table.rows[0][:2] == ["r", "control (continue)"]
+        assert table.rows[1][3] == "0.4000 [0.4000, 0.4000]" and table.rows[1][10] == "0.6000"  # any seed: 3 of 5
         paired = report.restarts_paired_table(summary)
-        assert [r[0] for r in paired.rows] == ["perturb 0.1, seed 0", "perturb 0.1, seed 1", "perturb 0.1, sequential"]
-        assert paired.rows[0][1:5] == ["1", "1", "1", "2"]
+        assert [r[1] for r in paired.rows] == ["perturb 0.1, 2 x 5 steps, seed 0", "perturb 0.1, 2 x 5 steps, seed 1",
+                                              "perturb 0.1, 2 x 5 steps, sequential"]
+        assert paired.rows[0][2:6] == ["1", "1", "1", "2"]
+        seq = report.restarts_sequential_table(summary)
+        assert [r[1] for r in seq.rows] == ["control (continue)", "perturb 0.1, 2 x 5 steps"] and seq.rows[1][3] == "0.6000"
         fig = report.plot_restarts_solved(summary)
         assert len(fig.axes) == 2
         fig, out = captured(report.plot_restarts_overall, summary)
         assert out == "" and len(fig.axes[0].lines) >= 1 + 2  # plain curve and the fixed-step lines
+        # A run written before attempts and grid hashes: those views skip with a note
+        result, out = captured(report.restarts_diversity_table, summary)
+        assert result is None and "no grid hashes" in out
+        result, out = captured(report.plot_restarts_solving_rate, summary)
+        assert "no per-step solving rate" in out
 
         no_ref = report.load_restarts(make_restarts(os.path.join(d, "r2"), with_reference=False))
         fig, out = captured(report.plot_restarts_overall, no_ref)
         assert "no plain reference" in out and fig is not None
-        for view in (report.restarts_table, report.restarts_paired_table, report.plot_restarts_solved,
-                     report.plot_restarts_overall):
-            assert view(None) is None
+        for name in RESTART_VIEWS:
+            assert getattr(report, name)(None) is None
         result, out = captured(report.load_restarts, None)
         assert result is None and "skipped" in out
-        result, out = captured(report.load_restarts, os.path.join(d, "missing"))
-        assert result is None and "not found" in out
+        result, out = captured(report.load_restarts, {"gone": os.path.join(d, "missing")})
+        assert result is None and "[restarts: gone] skipped" in out and "not found" in out
+
+
+def test_restart_views_two_checkpoints_with_short_attempts():
+    with tempfile.TemporaryDirectory() as d:
+        short = write_short_run(os.path.join(d, "short"))
+        known = make_restarts(os.path.join(d, "known"))
+        both = report.load_restarts({"tiny": short, "known": known, "missing": os.path.join(d, "x")})
+        assert list(both) == ["tiny", "known"]
+        seq = report.restarts_sequential_table(both)
+        settings = [r[1] for r in seq.rows if r[0] == "tiny"]
+        assert settings == ["control (continue)", "noisy restart 0, 2 x 2 steps", "noisy restart 0.5, 2 x 2 steps",
+                            "noisy restart 0, 1 x 4 steps", "noisy restart 0.5, 1 x 4 steps"]
+        assert {r[2] for r in seq.rows if r[0] == "tiny"} == {"8"}  # all at the control's budget, N1 + N2
+        div = report.restarts_diversity_table(both)
+        assert [r[0] for r in div.rows] == ["tiny"] * 4
+        zero = next(r for r in div.rows if r[1] == "noisy restart 0, 2 x 2 steps")
+        assert zero[3] == "1.00" and zero[5] == "1.0000" and zero[6] == "2: 100%"  # no noise: always the plain grid
+        fig = report.plot_restarts_solving_rate(both)
+        assert len(fig.axes) == 2 and len(fig.axes[0].lines) == 5  # control and 4 settings
+        fig = report.plot_restarts_diversity(both)
+        assert len(fig.axes) == 2 and len(fig.axes[0].patches) == 2 + 2 + 1 + 1
+        assert len(report.plot_restarts_solved(both).axes) == 4 and len(report.plot_restarts_overall(both).axes) == 2
+        paired = report.restarts_paired_table(both)
+        assert sum(r[0] == "tiny" for r in paired.rows) == 2 * 2 + 2 * 1 + 4
 
 
 def _execute_notebook(runs_source):
@@ -294,10 +330,10 @@ def test_notebook_runs_on_synthetic_output():
     with tempfile.TemporaryDirectory() as d:
         new = make_analysis(d, "new", 8, 4)
         old = make_analysis(d, "old", 6, 5, new_capture=False)
-        restarts = make_restarts(os.path.join(d, "restarts"))
+        restarts = {"known": make_restarts(os.path.join(d, "restarts")), "tiny": write_short_run(os.path.join(d, "short"))}
         source = (f"RUNS = {{'half': ({new!r}, 4), 'full': {new!r}, 'old': {old!r}}}\n"
-                  f"HEADS = ['q_head', 'probe']\nSET_NAME = 'all'\nLOG_HISTOGRAMS = False\nRESTARTS_DIR = {restarts!r}")
-        notes = _check_executed(_execute_notebook(source), (11, 11), (7, 7))
+                  f"HEADS = ['q_head', 'probe']\nSET_NAME = 'all'\nLOG_HISTOGRAMS = False\nRESTARTS = {restarts!r}")
+        notes = _check_executed(_execute_notebook(source), (13, 13), (9, 9))
         assert "[old] skipped" in notes and "[full]" not in notes
 
 
@@ -310,8 +346,8 @@ def test_notebook_runs_on_the_32_step_analysis():
         print(f"  (skipped: {os.path.relpath(REAL_OUTPUT, ROOT)} not present)")
         return
     # 4 figures and 3 tables from a capture without grid hashes and cell counts; 9 and 5 with them;
-    # 2 more of each with RESTARTS_DIR
-    _check_executed(_execute_notebook(None), (4, 11), (3, 7))
+    # 4 more of each with RESTARTS
+    _check_executed(_execute_notebook(None), (4, 13), (3, 9))
 
 
 if __name__ == "__main__":

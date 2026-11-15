@@ -315,6 +315,189 @@ def test_no_puzzle_retried():
         assert s["branches"][0]["retried"] == 0 and s["branches"][0]["solved_share"] is None
 
 
+def short_settings(settings, scales=(0.0, 0.5), lengths=(2, 4)):
+    """Noisy restarts only, attempts of the given lengths (N2 = 4: 2 x 2 and 1 x 4 steps)."""
+    settings.perturb_scales, settings.restart_scales = [], list(scales)
+    settings.seeds, settings.attempt_steps = [], list(lengths)
+    return settings
+
+
+def test_attempt_branches():
+    names = [b.name for b in rs.make_branches([0.1], [0.3], [], n2=8, attempt_steps=[4, 8])]
+    assert names == ["continue", "perturb_s0.1_a4_seed0", "perturb_s0.1_a4_seed1", "noisy_restart_s0.3_a4_seed0",
+                     "noisy_restart_s0.3_a4_seed1", "perturb_s0.1_a8_seed0", "noisy_restart_s0.3_a8_seed0"]
+    for name in names[1:]:
+        assert rs._parse(name)[:2] in {("perturb", 0.1), ("noisy_restart", 0.3)}
+    assert rs._parse("noisy_restart_s0.3_a4_seed1") == ("noisy_restart", 0.3, 1)
+    assert rs._parse("perturb_s0.001_seed2") == ("perturb", 0.001, 2)  # default mode: names unchanged
+    assert [b.length(8) for b in rs.make_branches([], [0.3], [0], n2=8)] == [8, 8]
+    try:
+        rs.make_branches([], [0.3], [], n2=8, attempt_steps=[3])
+        raise AssertionError("expected an error")
+    except ValueError as e:
+        assert "divide" in str(e)
+
+
+def test_short_attempts():
+    model, batch, plain, rec, settings = setup()
+    out = run(model, batch, short_settings(settings))
+    retried = out["retried"]
+    assert np.array_equal(out["phase1_pred_hash"], rec["pred_hash"][retried, :N1].numpy())
+    assert list(out["branches"]) == ["continue", "noisy_restart_s0_a2_seed0", "noisy_restart_s0_a2_seed1",
+                                     "noisy_restart_s0.5_a2_seed0", "noisy_restart_s0.5_a2_seed1",
+                                     "noisy_restart_s0_a4_seed0", "noisy_restart_s0.5_a4_seed0"]
+    logits = rec["q_halt_logits"].numpy()
+    thr = float(np.float32(settings.threshold))
+    for name, b in out["branches"].items():
+        length = 4 if name == "continue" or "_a4_" in name else 2
+        assert all(v.shape == (len(retried), length) for v in b["records"].values()), name
+        assert np.array_equal(b["final_pred_hash"], b["records"]["pred_hash"][:, -1].numpy())
+        assert ((b["halt_step"] > N1) & (b["halt_step"] <= N1 + length)).all()
+        # Not accepted within the attempt: the answer of its last step
+        assert np.array_equal(b["correct_at_halt"][~b["accepted"]], b["correct_at_last"][~b["accepted"]])
+        if "_s0_" in name:
+            # Without noise, a restart repeats the plain run's first steps
+            for key in ("pred_hash", "q_halt_logits", "seq_is_correct"):
+                assert torch.equal(b["records"][key], rec[key][retried, :length]), (name, key)
+            h = N1 + es.halting_steps(logits[retried, :length], thr)
+            assert np.array_equal(b["halt_step"], h)
+    # One attempt of N2 steps is the default mode's attempt with the same seed
+    default = run(model, batch, rs.Settings(n1=N1, n2=N2, threshold=settings.threshold, perturb_scales=[],
+                                            restart_scales=[0.5], seeds=[0]))
+    for k in ("accepted", "halt_step", "correct_at_halt", "final_pred_hash"):
+        assert np.array_equal(out["branches"]["noisy_restart_s0.5_a4_seed0"][k], default["branches"]["noisy_restart_s0.5_seed0"][k])
+    # Chunking and padding change nothing
+    settings.chunk_size = 5
+    chunked = run(model, batch, settings)
+    for name, b in out["branches"].items():
+        for k in ("accepted", "halt_step", "correct_at_halt", "final_pred_hash"):
+            assert np.array_equal(b[k], chunked["branches"][name][k]), (name, k)
+
+
+def test_sampled_puzzles():
+    a = rs.sample_positions([10, 14], 9, seed=3)
+    assert np.array_equal(a, rs.sample_positions([10, 14], 9, seed=3)) and len(np.unique(a)) == 9 and (np.diff(a) > 0).all()
+    assert not np.array_equal(a, rs.sample_positions([10, 14], 9, seed=4))
+    assert rs.sample_positions([10, 14], 24, seed=3) is None and rs.sample_positions([10, 14], None, seed=3) is None
+
+    # Two sets, loader batches of 4 (the last of each set padded); the sample repacked into batches of 4
+    data = {"inputs": torch.arange(24).view(24, 1), "labels": torch.arange(24).view(24, 1)}
+    loader = []
+    for name, lo, hi in (("a", 0, 10), ("b", 10, 24)):
+        for s in range(lo, hi, 4):
+            rows = torch.arange(s, s + 4).clamp(max=hi - 1)
+            loader.append((name, {k: v[rows] for k, v in data.items()}, min(4, hi - s)))
+    out = list(rs.keyed_batches(loader, {"a": 0, "b": 1}, [10, 14], a))
+    assert all(b["inputs"].shape[0] == 4 for b, _, _ in out) and len(out) == 3
+    sid = np.concatenate([s for _, s, _ in out])
+    ex = np.concatenate([e for _, _, e in out])
+    assert np.array_equal(np.where(sid == 0, 0, 10) + ex, a)
+    rows = torch.cat([b["inputs"][:len(s), 0] for b, s, _ in out]).numpy()
+    assert np.array_equal(rows, a)  # each kept row is the sampled puzzle
+    # Without a sample: the loader batches as they are
+    plain = list(rs.keyed_batches(loader, {"a": 0, "b": 1}, [10, 14]))
+    assert len(plain) == len(loader) and np.array_equal(plain[2][2], [8, 9]) and np.array_equal(plain[3][2], [0, 1, 2, 3])
+
+    # Same sample and same results whatever the loader's batches
+    model, batch, _, _, settings = setup(n=24)
+    settings.chunk_size = 8
+    with tempfile.TemporaryDirectory() as d:
+        full = os.path.join(d, "full")
+        rs.run_experiment(model, [("all", batch, 24)], settings, full, ["all"], [24], ckpt_step=1)
+        p_full = np.load(os.path.join(full, "phase1.npz"))
+        sample = rs.sample_positions([24], 10, seed=0)
+        for i, batches in enumerate(([("all", batch, 24)],
+                                     [("all", {k: v[:16] for k, v in batch.items()}, 16),
+                                      ("all", {k: torch.cat([v[16:], v[:8]]) for k, v in batch.items()}, 8)])):
+            out = os.path.join(d, f"s{i}")
+            rs.run_experiment(model, batches, settings, out, ["all"], [24], ckpt_step=1, max_puzzles=10, sample_seed=0)
+            p = np.load(os.path.join(out, "phase1.npz"))
+            assert np.array_equal(p["example_index"], sample)
+            for k in p.files:
+                assert np.array_equal(p[k], p_full[k][sample]), k
+            with open(os.path.join(out, "settings.json")) as f:
+                assert json.load(f)["sample_seed"] == 0
+
+
+def write_short_run(d):
+    """A finished run of the tiny model with noisy restarts of 2 x 2 and 1 x 4 steps (N2 = 4), summarized."""
+    model, batch, _, _, settings = setup(n=24)
+    short_settings(settings)
+    rs.run_experiment(model, [("all", batch, 24)], settings, d, ["all"], [24], ckpt_step=1,
+                      extra_settings={"selection_frac": 0.0, "split_seed": 0})
+    rs.summarize(d, num_resamples=50, verbose=False)
+    return d
+
+
+def test_summary_of_short_attempts():
+    model, batch, plain, rec, settings = setup(n=24)
+    short_settings(settings)
+    with tempfile.TemporaryDirectory() as d:
+        ref = os.path.join(d, "plain")
+        os.makedirs(ref)
+        save_capture(os.path.join(ref, "step_1_eval_steps.0"), plain)
+        out = os.path.join(d, "out")
+        rs.run_experiment(model, [("all", batch, 24)], settings, out, ["all"], [24], ckpt_step=1,
+                          extra_settings={"selection_frac": 0.0, "split_seed": 0})
+        s = rs.summarize(out, reference=(ref, 1), num_resamples=100, verbose=False)
+        p1 = np.load(os.path.join(out, "phase1.npz"))
+        retried = np.flatnonzero(~p1["accepted"])
+        R = len(retried)
+        assert s["split"]["retried_report_puzzles"] == R > 0
+        correct = rec["seq_is_correct"].numpy()[retried]
+        before = correct[:, N1 - 1]
+
+        # Control: solving rate at steps N1 + 1 ... N1 + N2, as in the plain run
+        rate = s["control_solving_rate"]
+        assert [r["step"] for r in rate] == list(range(N1 + 1, N1 + N2 + 1))
+        for k, r in enumerate(rate):
+            prev = before if k == 0 else correct[:, N1 + k - 1]
+            assert (r["unsolved_at_previous_step"], r["solved"]) == ((~prev).sum(), (~prev & correct[:, N1 + k]).sum())
+            assert "rate_ci" in r or r["rate"] is None
+
+        g = {(x["scale"], x["attempt_steps"]): x for x in s["groups"]}
+        assert sorted(g) == [(0.0, 2), (0.0, 4), (0.5, 2), (0.5, 4)]
+        assert [(x["attempts"], x["budget"]) for x in (g[0.0, 2], g[0.0, 4])] == [(2, N1 + N2), (1, N1 + N2)]
+        assert "same total budget" in g[0.0, 2]["sequential"]["note"]
+
+        # Noise 0: both attempts repeat the plain run's first 2 steps
+        zero = g[0.0, 2]
+        for k, r in enumerate(zero["solving_rate"]):
+            prev = before if k == 0 else correct[:, k - 1]
+            n, solved = (~prev).sum(), (~prev & correct[:, k]).sum()
+            assert (r["step"], r["unsolved_at_previous_step"], r["solved"]) == (k + 1, 2 * n, 2 * solved)
+            assert "rate_ci_approx" in r or r["rate"] is None
+        div = zero["diversity"]
+        assert div["distinct_final_grids"] == {"mean": 1.0, "counts": [R, 0]}
+        assert div["same_as_unperturbed"]["share_of_attempts"] == 1.0 and div["same_as_unperturbed"]["counts"] == [0, 0, R]
+        assert "step 2" in div["same_as_unperturbed"]["unperturbed"]
+        # Sequential with identical attempts: the first attempt decides when it is accepted
+        h = es.halting_steps(rec["q_halt_logits"].numpy()[retried, :2], float(np.float32(settings.threshold)))
+        acc = rec["q_halt_logits"].numpy()[retried, :2].max(axis=1) >= float(np.float32(settings.threshold))
+        seq = zero["sequential"]
+        assert seq["accepted"] == acc.sum() and seq["solved"] == correct[np.arange(R), h - 1].sum()
+        assert np.isclose(seq["mean_steps"], np.mean(np.where(acc, N1 + h, N1 + 2 + 2)))
+        assert seq["attempts_used"] == [int(acc.sum()), int(R - acc.sum())]
+
+        # Noise 0.5: diversity counts add up; the reference covers the budget N1 + 2 x 2
+        div = g[0.5, 2]["diversity"]
+        assert sum(div["distinct_final_grids"]["counts"]) == R and sum(div["same_as_unperturbed"]["counts"]) == R
+        assert g[0.5, 2]["sequential"]["paired_with_plain_same_budget"]["budget"] == N1 + N2
+        assert s["reference"]["control_check"]["same_pred_hash"] == R
+
+        # A reference with only N1 steps still checks phase 1
+        short_ref = os.path.join(d, "short")
+        os.makedirs(short_ref)
+        save_capture(os.path.join(short_ref, "step_1_eval_steps.0"), {"step_records": {k: v[:N1] for k, v in plain["step_records"].items()}})
+        s2 = rs.summarize(out, reference=(short_ref, 1), num_resamples=10, verbose=False)
+        assert s2["reference"]["phase1_check"]["same_acceptance"] == 24
+        assert "fewer than" in s2["reference"]["control_check"] and s2["reference"]["plain_continuation"] == []
+
+        with open(os.path.join(out, "summary.csv")) as f:
+            rows = f.read().splitlines()
+        assert "attempt_steps" in rows[0] and len(rows) == 1 + 7 + 4  # no plain rows: the last summary had the short reference
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for t in tests:

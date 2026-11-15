@@ -4,11 +4,15 @@ Phase 1 runs every test puzzle for N1 steps with halting by a head and threshold
 rule of utils/eval_loop.py). The puzzles the head has not accepted by step N1 are retried: ground
 truth is never used to choose them, only to score the results.
 
-Phase 2 gives each variant the same retried puzzles and the same extra budget of N2 steps, with
-the same halting rule:
+Phase 2 gives each variant the same retried puzzles, with the same halting rule:
     continue        the state of step N1, unchanged (the control: a plain run to N1 + N2 steps)
     perturb         the state of step N1 plus noise
     noisy_restart   the model's initial state (H_init, L_init) plus noise
+By default every attempt of a noisy variant has N2 steps, one attempt per seed. With
+--attempt-steps A [A ...], each length A gives N2 / A attempts of A steps per scale (seeds
+0 ... N2/A - 1): together they use the control's budget, and the sequential strategy (attempts in
+seed order, first answer the head accepts kept) is compared with the control at equal budget.
+An attempt ends at its last step: a puzzle not accepted within it answers with that step's grid.
 Noise is i.i.d. Gaussian over the whole state (all positions and dimensions), rescaled per puzzle
 and separately for z_H and z_L to norm = scale * norm of the state it is added to. Its direction
 depends only on (seed, set, example index): it does not change with batch size or order, and it is
@@ -19,8 +23,15 @@ N1 calls, and every variant continues from that in-memory state with the step co
 the wrapper never resets it. For each batch, all variants of its retried puzzles are stacked into
 batches of the evaluation batch size (padded, so the compiled model sees one shape).
 
+--max-puzzles N runs a random sample of N test puzzles, drawn with --sample-seed (default 0) from
+the whole test set: the same sample for every checkpoint of the same dataset. The sampled puzzles
+are repacked into full batches.
+
     # On a GPU node (from the repository root):
     python experiments/restarts.py run CKPT OUT_DIR [--max-puzzles 5000] [--reference DIR STEP]
+    # Short noisy restarts, 8 x 4 and 4 x 8 steps, against 32 steps of continuation:
+    python experiments/restarts.py run CKPT OUT_DIR --n2 32 --attempt-steps 4 8 \
+        --perturb-scales --restart-scales 0.1 0.3 --threshold T
     # Recompute the summary, e.g. on a laptop with a plain capture as reference:
     python experiments/restarts.py summarize OUT_DIR --reference DIR STEP
 
@@ -29,15 +40,17 @@ OUT_DIR gets:
     phase1.npz                       per puzzle: key, accepted by step N1, halting step, correctness
     phase2.npz                       per branch and retried puzzle: accepted, halting step, correctness,
                                      the relative size of the noise actually applied (after rounding
-                                     to the state's dtype)
+                                     to the state's dtype), the grid hash of the last step; per branch
+                                     the attempt length; per retried puzzle the grid hashes of the
+                                     phase-1 steps
     captures/<branch>/step_<N>_eval_steps.0
                                      phase-2 steps of the retried puzzles in the per-step capture format
                                      (step_offset = N1); readable by analysis/eval_steps.py
     summary.json, summary.csv        see summarize()
 
---reference DIR STEP: a plain capture of the same checkpoint with at least N1 + N2 steps (e.g. the
-128-step one). The summary then checks phase 1 and the control against it, and adds plain
-continuation to the same budgets as reference points.
+--reference DIR STEP: a plain capture of the same checkpoint with at least N1 steps (e.g. the
+128-step one). The summary then checks phase 1 against it and, if the capture has N1 + N2 steps
+or more, the control too, and adds plain continuation to the budgets it covers as reference points.
 """
 import argparse
 import csv
@@ -55,11 +68,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 from analysis import eval_steps as es  # noqa: E402
 from models.losses import compute_correctness  # noqa: E402
-from utils.eval_loop import CAPTURE_RETURN_KEYS, FrozenOutputs, StepRecorder, halt_logit  # noqa: E402
+from utils.eval_loop import CAPTURE_RETURN_KEYS, FrozenOutputs, StepRecorder, grid_hash, halt_logit  # noqa: E402
 
 VARIANTS = ("continue", "perturb", "noisy_restart")
 DEFAULTS = dict(n1=32, n2=32, head="q_head", threshold=5.27, perturb_scales=[0.001, 0.1, 0.3, 1.0],
-                restart_scales=[0.1, 0.3, 1.0], seeds=[0, 1, 2], selection_frac=0.2, split_seed=0)
+                restart_scales=[0.1, 0.3, 1.0], seeds=[0, 1, 2], selection_frac=0.2, split_seed=0, sample_seed=0)
 NOISE_SEED = 0x7E57_0F_4E015E  # constant: noise is comparable across runs
 _MASK64 = (1 << 64) - 1
 
@@ -72,17 +85,36 @@ class Branch:
     variant: str
     scale: float = 0.0
     seed: Optional[int] = None
+    steps: Optional[int] = None  # attempt length; None: N2, the control's budget
 
     @property
     def name(self) -> str:
-        return self.variant if self.variant == "continue" else f"{self.variant}_s{self.scale:g}_seed{self.seed}"
+        if self.variant == "continue":
+            return self.variant
+        attempt = "" if self.steps is None else f"_a{self.steps}"
+        return f"{self.variant}_s{self.scale:g}{attempt}_seed{self.seed}"
+
+    def length(self, n2: int) -> int:
+        return n2 if self.steps is None else self.steps
 
 
-def make_branches(perturb_scales: Sequence[float], restart_scales: Sequence[float], seeds: Sequence[int]) -> List[Branch]:
-    """The control first, then every (scale, seed) of each noisy variant."""
+def make_branches(perturb_scales: Sequence[float], restart_scales: Sequence[float], seeds: Sequence[int],
+                  n2: Optional[int] = None, attempt_steps: Optional[Sequence[int]] = None) -> List[Branch]:
+    """The control first, then the noisy variants.
+
+    Without attempt_steps: every (scale, seed) of each variant, each attempt with N2 steps.
+    With attempt_steps: for each length A, N2 / A attempts of A steps per scale, with seeds
+    0 ... N2/A - 1 (`seeds` is not used)."""
     out = [Branch("continue")]
-    out += [Branch("perturb", float(s), int(k)) for s in perturb_scales for k in seeds]
-    out += [Branch("noisy_restart", float(s), int(k)) for s in restart_scales for k in seeds]
+    if not attempt_steps:
+        out += [Branch("perturb", float(s), int(k)) for s in perturb_scales for k in seeds]
+        out += [Branch("noisy_restart", float(s), int(k)) for s in restart_scales for k in seeds]
+        return out
+    for a in attempt_steps:
+        if a < 1 or n2 % a:
+            raise ValueError(f"attempt length {a} must divide N2 = {n2}")
+        for variant, scales in (("perturb", perturb_scales), ("noisy_restart", restart_scales)):
+            out += [Branch(variant, float(s), k, int(a)) for s in scales for k in range(n2 // a)]
     return out
 
 
@@ -200,10 +232,11 @@ class Settings:
     perturb_scales: List[float] = dataclasses.field(default_factory=lambda: list(DEFAULTS["perturb_scales"]))
     restart_scales: List[float] = dataclasses.field(default_factory=lambda: list(DEFAULTS["restart_scales"]))
     seeds: List[int] = dataclasses.field(default_factory=lambda: list(DEFAULTS["seeds"]))
+    attempt_steps: List[int] = dataclasses.field(default_factory=list)  # empty: attempts of N2 steps
     chunk_size: Optional[int] = None  # phase-2 batch size (padded to it); None: one batch, unpadded
 
     def branches(self) -> List[Branch]:
-        return make_branches(self.perturb_scales, self.restart_scales, self.seeds)
+        return make_branches(self.perturb_scales, self.restart_scales, self.seeds, self.n2, self.attempt_steps)
 
 
 def run_batch(model: Any, batch: Dict[str, torch.Tensor], set_id: np.ndarray, example_index: np.ndarray,
@@ -211,7 +244,8 @@ def run_batch(model: Any, batch: Dict[str, torch.Tensor], set_id: np.ndarray, ex
     """Both phases for one batch. Rows beyond len(set_id) are padding and are ignored.
 
     The model's evaluation step limit must be N1 + N2. Returns phase-1 arrays for the valid rows,
-    the retried rows, and per branch: phase-2 arrays and capture records of the retried puzzles."""
+    the retried rows with their phase-1 grid hashes, and per branch: phase-2 arrays and capture
+    records of the retried puzzles."""
     n1, n2 = settings.n1, settings.n2
     num_valid = len(set_id)
     return_keys = set(CAPTURE_RETURN_KEYS)
@@ -226,11 +260,13 @@ def run_batch(model: Any, batch: Dict[str, torch.Tensor], set_id: np.ndarray, ex
     with torch.device(device):
         carry = model.initial_carry(batch)
     frozen = FrozenOutputs(threshold)
+    hashes = []
     for step in range(1, n1 + 1):
         carry, _, _, preds, all_finish = model(carry=carry, batch=batch, return_keys=return_keys)
         if all_finish:
             raise RuntimeError(f"the model stopped at step {step}: its evaluation step limit must be N1 + N2 = {n1 + n2}")
         frozen.update(step, halt_logit(preds, settings.head), {"preds": preds["preds"]}, is_last=False)
+        hashes.append(grid_hash(preds["preds"]))
     labels = batch["labels"]
     correct_at_halt = compute_correctness(frozen.outputs["preds"], labels)[3]
     correct_at_n1 = compute_correctness(preds["preds"], labels)[3]
@@ -239,96 +275,148 @@ def run_batch(model: Any, batch: Dict[str, torch.Tensor], set_id: np.ndarray, ex
               "correct_at_halt": (correct_at_halt[:num_valid].cpu().numpy() & accepted),
               "correct_at_n1": correct_at_n1[:num_valid].cpu().numpy()}
     retried = np.flatnonzero(~accepted)
-    out = {"phase1": phase1, "retried": retried, "branches": {}}
+    idx = torch.as_tensor(retried, device=labels.device)
+    out = {"phase1": phase1, "retried": retried, "branches": {},
+           "phase1_pred_hash": torch.stack(hashes, 1)[idx].cpu().numpy()}
     if len(retried) == 0:
         return out
 
-    # Phase 2: every branch on the retried rows, stacked
-    idx = torch.as_tensor(retried, device=labels.device)
+    # Phase 2: the branches on the retried rows, stacked, one run per attempt length
     base = map_tensors(carry, lambda t: t[idx])
     sub_batch = {k: v[idx] for k, v in batch.items()}
     last_preds = preds["preds"][idx]
-    units = {seed: unit_noise(base.inner_carry.z_H.shape[1:], seed, set_id[retried], example_index[retried])
-             for seed in settings.seeds}
     branches = settings.branches()
-    starts, scale_h, scale_l = [], [], []
-    for b in branches:
-        c, rh, rl = branch_carry(model, base, b, units[b.seed] if b.seed is not None else None)
-        starts.append(c)
-        scale_h.append(rh)
-        scale_l.append(rl)
-    all_carry = cat_tensors(starts)
-    all_batch = cat_tensors([sub_batch] * len(branches))
-    all_prev = torch.cat([last_preds] * len(branches))
-    total = len(branches) * len(retried)
+    units = {seed: unit_noise(base.inner_carry.z_H.shape[1:], seed, set_id[retried], example_index[retried])
+             for seed in sorted({b.seed for b in branches if b.seed is not None})}
+    starts = {b.name: branch_carry(model, base, b, units[b.seed] if b.seed is not None else None) for b in branches}
+    R = len(retried)
+    for length in sorted({b.length(n2) for b in branches}, reverse=True):
+        group = [b for b in branches if b.length(n2) == length]
+        res = _run_steps(model, cat_tensors([starts[b.name][0] for b in group]), cat_tensors([sub_batch] * len(group)),
+                         torch.cat([last_preds] * len(group)), length, settings)
+        for i, b in enumerate(group):
+            sl = slice(i * R, (i + 1) * R)
+            out["branches"][b.name] = {
+                **{k: v[sl].numpy() for k, v in res["flat"].items()},
+                "realized_scale_z_H": starts[b.name][1].cpu().numpy(), "realized_scale_z_L": starts[b.name][2].cpu().numpy(),
+                "records": {key: v[sl] for key, v in res["records"].items()},
+                "puzzle_identifiers": sub_batch["puzzle_identifiers"].cpu(),
+            }
+    out["branches"] = {b.name: out["branches"][b.name] for b in branches}
+    return out
 
+
+def _run_steps(model: Any, carry: Any, batch: Dict[str, torch.Tensor], prev_preds: torch.Tensor, length: int,
+               settings: Settings) -> dict:
+    """`length` phase-2 steps of stacked rows (from step N1 + 1), in chunks of settings.chunk_size.
+
+    An attempt shorter than N2 ends at its last step: a row not accepted within it answers with
+    that step's grid. Returns flat per-row arrays (accepted, halt_step, correct_at_halt,
+    correct_at_last, final_pred_hash) and the capture records ([rows, length] tensors)."""
+    n1, n2, threshold = settings.n1, settings.n2, settings.threshold
+    return_keys = set(CAPTURE_RETURN_KEYS)
+    total = batch["labels"].shape[0]
+    device = batch["labels"].device
     chunk = settings.chunk_size or total
-    pieces = {"accepted": [], "halt_step": [], "correct_at_halt": [], "correct_at_last": [], "records": []}
+    pieces = {"accepted": [], "halt_step": [], "correct_at_halt": [], "correct_at_last": [], "final_pred_hash": [], "records": []}
     for a in range(0, total, chunk):
-        rows = torch.arange(a, min(a + chunk, total), device=labels.device)
+        rows = torch.arange(a, min(a + chunk, total), device=device)
         n = len(rows)
         if settings.chunk_size and n < chunk:  # pad to the fixed batch size with copies of the first row
             rows = torch.cat([rows, rows[:1].repeat(chunk - n)])
-        c = map_tensors(all_carry, lambda t: t[rows])
-        bt = {k: v[rows] for k, v in all_batch.items()}
-        recorder = StepRecorder(prev_preds=all_prev[rows], prev_carry=c)
-        frozen2 = FrozenOutputs(threshold)
+        c = map_tensors(carry, lambda t: t[rows])
+        bt = {k: v[rows] for k, v in batch.items()}
+        recorder = StepRecorder(prev_preds=prev_preds[rows], prev_carry=c)
+        frozen = FrozenOutputs(threshold)
         max_logit = None
-        for k in range(1, n2 + 1):
+        for k in range(1, length + 1):
             c, _, _, p, all_finish = model(carry=c, batch=bt, return_keys=return_keys)
             if bool(all_finish) != (k == n2):
                 raise RuntimeError(f"phase 2 finished at step {n1 + k}, expected {n1 + n2}")
             recorder.record(p, c, bt["labels"])
             logit = halt_logit(p, settings.head)
-            frozen2.update(n1 + k, logit, {"preds": p["preds"]}, is_last=(k == n2))
+            frozen.update(n1 + k, logit, {"preds": p["preds"]}, is_last=(k == length))
             max_logit = logit if max_logit is None else torch.maximum(max_logit, logit)
         thr = torch.tensor(threshold, dtype=max_logit.dtype, device=max_logit.device)
         pieces["accepted"].append((max_logit >= thr)[:n].cpu())
-        pieces["halt_step"].append(frozen2.halt_step[:n].cpu())
-        pieces["correct_at_halt"].append(compute_correctness(frozen2.outputs["preds"], bt["labels"])[3][:n].cpu())
+        pieces["halt_step"].append(frozen.halt_step[:n].cpu())
+        pieces["correct_at_halt"].append(compute_correctness(frozen.outputs["preds"], bt["labels"])[3][:n].cpu())
         pieces["correct_at_last"].append(compute_correctness(p["preds"], bt["labels"])[3][:n].cpu())
+        pieces["final_pred_hash"].append(grid_hash(p["preds"])[:n].cpu())
         pieces["records"].append({key: torch.stack(v, 1)[:n].cpu() for key, v in recorder.step_records.items()})
-
-    flat = {k: torch.cat(v) for k, v in pieces.items() if k != "records"}
-    records = {key: torch.cat([r[key] for r in pieces["records"]]) for key in pieces["records"][0]}
-    R = len(retried)
-    for i, b in enumerate(branches):
-        sl = slice(i * R, (i + 1) * R)
-        out["branches"][b.name] = {
-            "accepted": flat["accepted"][sl].numpy(), "halt_step": flat["halt_step"][sl].numpy(),
-            "correct_at_halt": flat["correct_at_halt"][sl].numpy(), "correct_at_last": flat["correct_at_last"][sl].numpy(),
-            "realized_scale_z_H": scale_h[i].cpu().numpy(), "realized_scale_z_L": scale_l[i].cpu().numpy(),
-            "records": {key: v[sl] for key, v in records.items()},
-            "puzzle_identifiers": sub_batch["puzzle_identifiers"].cpu(),
-        }
-    return out
+    return {"flat": {k: torch.cat(v) for k, v in pieces.items() if k != "records"},
+            "records": {key: torch.cat([r[key] for r in pieces["records"]]) for key in pieces["records"][0]}}
 
 
 # --------------------------------------------------------------------------- whole test set
 
 
+def sample_positions(set_sizes: Sequence[int], max_puzzles: Optional[int], seed: int) -> Optional[np.ndarray]:
+    """Sorted positions (over the test sets in order) of a random sample of max_puzzles puzzles,
+    drawn with its own generator from `seed`; None for every puzzle."""
+    total = int(sum(set_sizes))
+    if max_puzzles is None or max_puzzles >= total:
+        return None
+    return np.sort(np.random.default_rng(seed).choice(total, size=max_puzzles, replace=False))
+
+
+def keyed_batches(batches, set_ids: Dict[str, int], set_sizes: Sequence[int], positions: Optional[np.ndarray] = None):
+    """(batch, set_id, example_index) per model batch; set_id and example_index cover the valid rows,
+    any further rows are padding.
+
+    batches: (set_name, batch, global_batch_size) as the test loader yields them. With positions
+    (see sample_positions), only those puzzles are kept, repacked into batches of the loader's batch
+    size; the last one is padded with copies of its first row."""
+    offsets = np.concatenate([[0], np.cumsum(set_sizes)[:-1]]).astype(np.int64)
+    next_start: Dict[str, int] = {}
+    pending, size = [], None
+
+    def take(n):
+        merged = (cat_tensors([p[0] for p in pending]), np.concatenate([p[1] for p in pending]),
+                  np.concatenate([p[2] for p in pending]))
+        rest = len(merged[1]) - n
+        pending.clear()
+        if rest > 0:
+            pending.append(({k: v[n:] for k, v in merged[0].items()}, merged[1][n:], merged[2][n:]))
+        return {k: v[:n] for k, v in merged[0].items()}, merged[1][:n], merged[2][:n]
+
+    for set_name, batch, global_batch_size in batches:
+        start = next_start.get(set_name, 0)
+        num_valid = min(global_batch_size, batch["inputs"].shape[0])
+        next_start[set_name] = start + num_valid
+        sid = np.full(num_valid, set_ids[set_name], dtype=np.int64)
+        ex = np.arange(start, start + num_valid, dtype=np.int64)
+        if positions is None:
+            yield batch, sid, ex
+            continue
+        size = size or batch["inputs"].shape[0]
+        keep = np.flatnonzero(np.isin(offsets[sid] + ex, positions))
+        if len(keep):
+            rows = torch.as_tensor(keep)
+            pending.append(({k: v[rows] for k, v in batch.items()}, sid[keep], ex[keep]))
+        while pending and sum(len(p[1]) for p in pending) >= size:
+            yield take(size)
+    if positions is not None and pending:
+        b, sid, ex = take(sum(len(p[1]) for p in pending))
+        pad = torch.zeros(size - len(sid), dtype=torch.long)
+        yield {k: torch.cat([v, v[pad]]) for k, v in b.items()}, sid, ex
+
+
 def run_experiment(model: Any, batches, settings: Settings, out_dir: str, set_names: List[str], set_sizes: List[int],
-                   ckpt_step: int, max_puzzles: Optional[int] = None, extra_settings: Optional[dict] = None):
+                   ckpt_step: int, max_puzzles: Optional[int] = None, sample_seed: int = DEFAULTS["sample_seed"],
+                   extra_settings: Optional[dict] = None):
     """batches: iterable of (set_name, batch, global_batch_size) as the test loader yields them
-    (one process). Writes settings.json, phase1.npz, phase2.npz and the captures to out_dir."""
+    (one process). max_puzzles: a random sample of that many puzzles (see sample_positions).
+    Writes settings.json, phase1.npz, phase2.npz and the captures to out_dir."""
     os.makedirs(out_dir, exist_ok=True)
     branches = settings.branches()
     set_ids = {name: i for i, name in enumerate(set_names)}
-    next_start: Dict[str, int] = {}
+    positions = sample_positions(set_sizes, max_puzzles, sample_seed)
     p1: Dict[str, list] = {k: [] for k in ("set_id", "example_index", "accepted", "halt_step", "correct_at_halt", "correct_at_n1")}
     p2: Dict[str, Dict[str, list]] = {b.name: {} for b in branches}
-    keys: Dict[str, list] = {"set_id": [], "example_index": []}
+    keys: Dict[str, list] = {"set_id": [], "example_index": [], "phase1_pred_hash": []}
     done = 0
-    for batch_i, (set_name, batch, global_batch_size) in enumerate(batches):
-        start = next_start.get(set_name, 0)
-        next_start[set_name] = start + batch["inputs"].shape[0]
-        num_valid = min(global_batch_size, batch["inputs"].shape[0])
-        if max_puzzles is not None:
-            num_valid = min(num_valid, max_puzzles - done)
-        if num_valid <= 0:
-            break
-        sid = np.full(num_valid, set_ids[set_name], dtype=np.int64)
-        ex = np.arange(start, start + num_valid, dtype=np.int64)
+    for batch_i, (batch, sid, ex) in enumerate(keyed_batches(batches, set_ids, set_sizes, positions)):
         with torch.inference_mode():
             res = run_batch(model, batch, sid, ex, settings)
         p1["set_id"].append(sid)
@@ -337,10 +425,11 @@ def run_experiment(model: Any, batches, settings: Settings, out_dir: str, set_na
             p1[k].append(v)
         keys["set_id"].append(sid[res["retried"]])
         keys["example_index"].append(ex[res["retried"]])
+        keys["phase1_pred_hash"].append(res["phase1_pred_hash"])
         for name, r in res["branches"].items():
             for k, v in r.items():
                 p2[name].setdefault(k, []).append(v)
-        done += num_valid
+        done += len(sid)
         print(f"batch {batch_i + 1}: {done} puzzles, {len(res['retried'])} retried in this batch", flush=True)
 
     phase1 = {k: np.concatenate(v) for k, v in p1.items()}
@@ -350,17 +439,19 @@ def run_experiment(model: Any, batches, settings: Settings, out_dir: str, set_na
 
     r_sid, r_ex = np.concatenate(keys["set_id"]), np.concatenate(keys["example_index"])
     order = np.lexsort((r_ex, r_sid))
-    phase2 = {"set_id": r_sid[order], "example_index": r_ex[order], "branches": np.array([b.name for b in branches])}
+    phase2 = {"set_id": r_sid[order], "example_index": r_ex[order], "branches": np.array([b.name for b in branches]),
+              "attempt_steps": np.array([b.length(settings.n2) for b in branches], dtype=np.int64),
+              "phase1_pred_hash": np.concatenate(keys["phase1_pred_hash"]).reshape(-1, settings.n1)[order]}
     dtypes = {"accepted": bool, "halt_step": np.int64, "correct_at_halt": bool, "correct_at_last": bool,
-              "realized_scale_z_H": np.float32, "realized_scale_z_L": np.float32}
+              "realized_scale_z_H": np.float32, "realized_scale_z_L": np.float32, "final_pred_hash": np.int64}
     for field, dtype in dtypes.items():
         phase2[field] = np.stack([np.concatenate(p2[b.name][field])[order] for b in branches]) if len(order) else \
             np.zeros((len(branches), 0), dtype=dtype)
     np.savez(os.path.join(out_dir, "phase2.npz"), **phase2)
 
-    # Captures in the per-step format (steps N1 + 1 ... N1 + N2 of the retried puzzles)
+    # Captures in the per-step format (steps N1 + 1 ... N1 + length of the retried puzzles)
     subset = (f"puzzles not accepted by {settings.head} (threshold {settings.threshold:g}) by step {settings.n1}"
-              + (f", among the first {max_puzzles}" if max_puzzles is not None else ""))
+              + (f", in a random sample of {max_puzzles} (seed {sample_seed})" if positions is not None else ""))
     torder = torch.as_tensor(order)
     for b in branches:
         if not len(order):
@@ -369,7 +460,7 @@ def run_experiment(model: Any, batches, settings: Settings, out_dir: str, set_na
         rec.update(
             puzzle_identifiers=torch.cat(p2[b.name]["puzzle_identifiers"])[torder],
             example_index=torch.as_tensor(phase2["example_index"]), set_id=torch.as_tensor(phase2["set_id"], dtype=torch.int32),
-            num_steps=torch.full((len(order), ), settings.n2, dtype=torch.int32),
+            num_steps=torch.full((len(order), ), b.length(settings.n2), dtype=torch.int32),
             halt_step=torch.as_tensor(phase2["halt_step"][branches.index(b)] - settings.n1, dtype=torch.int32),
             set_names=list(set_names), eval_halt_head=settings.head, eval_halt_threshold=float(settings.threshold),
             step_offset=settings.n1, set_sizes=list(set_sizes), puzzle_subset=f"{subset}; branch {b.name}")
@@ -379,7 +470,8 @@ def run_experiment(model: Any, batches, settings: Settings, out_dir: str, set_na
 
     with open(os.path.join(out_dir, "settings.json"), "w") as f:
         json.dump({**dataclasses.asdict(settings), "set_names": list(set_names), "set_sizes": list(set_sizes),
-                   "ckpt_step": ckpt_step, "max_puzzles": max_puzzles, "num_puzzles": int(len(phase1["set_id"])),
+                   "ckpt_step": ckpt_step, "max_puzzles": max_puzzles, "sample_seed": sample_seed,
+                   "num_puzzles": int(len(phase1["set_id"])),
                    "branches": [b.name for b in branches], **(extra_settings or {})}, f, indent=2)
 
 
@@ -421,15 +513,60 @@ def _overall(p1: dict, report: np.ndarray, retried_rows: np.ndarray, correct, st
     return {"puzzles": n, "accuracy": total_correct / n if n else None, "avg_steps": total_steps / n if n else None}
 
 
-def sequential(accepted: np.ndarray, halt_step: np.ndarray, correct: np.ndarray, n1: int, n2: int):
+def sequential(accepted: np.ndarray, halt_step: np.ndarray, correct: np.ndarray, n1: int, attempt_steps: int):
     """Deployable restart strategy over seeds in order ([seeds, R] arrays): keep the first answer the
-    head accepts; if none is accepted, the last attempt's answer. Steps count every attempt."""
+    head accepts; if none is accepted, the last attempt's answer. Steps count every attempt
+    (attempt_steps each, up to the accepting step in the attempt that is kept)."""
     S, R = accepted.shape
     any_acc = accepted.any(axis=0)
     first = np.where(any_acc, accepted.argmax(axis=0), S - 1)
     cols = np.arange(R)
-    steps = n1 + n2 * first + (halt_step[first, cols] - n1)
+    steps = n1 + attempt_steps * first + (halt_step[first, cols] - n1)
     return any_acc, correct[first, cols], steps, first
+
+
+def step_rates(before: np.ndarray, correct: np.ndarray, first_step: int = 1, exact: bool = True) -> List[dict]:
+    """Solving rate per step of a branch, pooled over attempts.
+
+    before: [R] correctness of each puzzle just before the branch (step N1). correct: [K, R, L]
+    correctness at each step of K attempts. Step k: of the (attempt, puzzle) pairs wrong at step
+    k - 1 (step 0: before the branch), the share correct at step k. With several attempts per
+    puzzle the pairs are not independent, so the Wilson interval is approximate (exact=False:
+    reported as rate_ci_approx)."""
+    K, R, L = correct.shape
+    prev = np.concatenate([np.broadcast_to(before[None, :, None], (K, R, 1)), correct[:, :, :-1]], axis=2)
+    unsolved = (~prev).sum(axis=(0, 1))
+    solved = (~prev & correct).sum(axis=(0, 1))
+    key = "rate_ci" if exact else "rate_ci_approx"
+    return [{"step": first_step + k, "step_in_branch": k + 1, "unsolved_at_previous_step": int(unsolved[k]),
+             "solved": int(solved[k]), "rate": float(solved[k] / unsolved[k]) if unsolved[k] else None,
+             key: es.wilson_interval(int(solved[k]), int(unsolved[k])) if unsolved[k] else None} for k in range(L)]
+
+
+def diversity(final_hash: np.ndarray, unperturbed_hash: Optional[np.ndarray] = None) -> dict:
+    """final_hash: [K, R] grid hash of each attempt's last step. Per puzzle, the number of distinct
+    final grids over its K attempts; with unperturbed_hash ([R]: the grid the same steps give
+    without noise), the share of attempts ending on that grid, and per puzzle how many do.
+    counts[i] = number of puzzles with i + 1 distinct grids / with i matching attempts."""
+    K, R = final_hash.shape
+    s = np.sort(final_hash, axis=0)
+    distinct = 1 + (s[1:] != s[:-1]).sum(axis=0)
+    out = {"attempts": int(K), "puzzles": int(R),
+           "distinct_final_grids": {"mean": float(distinct.mean()) if R else None,
+                                    "counts": np.bincount(distinct - 1, minlength=K).tolist() if R else [0] * K}}
+    if unperturbed_hash is not None:
+        same = final_hash == unperturbed_hash[None, :]
+        out["same_as_unperturbed"] = {"share_of_attempts": float(same.mean()) if R else None,
+                                      "counts": np.bincount(same.sum(axis=0), minlength=K + 1).tolist()}
+    return out
+
+
+def _capture_field(out_dir: str, branch: str, ckpt_step: int, key: str) -> Optional[np.ndarray]:
+    path = os.path.join(out_dir, "captures", branch, f"step_{ckpt_step}_eval_steps.0")
+    if not os.path.exists(path):
+        return None
+    value = torch.load(path, map_location="cpu", weights_only=False).get(key)
+    return None if value is None else value.numpy()
 
 
 def summarize(out_dir: str, reference: Optional[tuple] = None, num_resamples: int = 10000,
@@ -443,6 +580,7 @@ def summarize(out_dir: str, reference: Optional[tuple] = None, num_resamples: in
     p1 = dict(np.load(os.path.join(out_dir, "phase1.npz")))
     p2 = dict(np.load(os.path.join(out_dir, "phase2.npz")))
     names = [str(x) for x in p2["branches"]]
+    attempt = [int(x) for x in p2["attempt_steps"]] if "attempt_steps" in p2 else [n2] * len(names)
     rng = np.random.default_rng(sseed + 1)
 
     report1 = ~es.split_subset(p1["set_id"], p1["example_index"], settings["set_sizes"], frac, sseed)
@@ -459,6 +597,9 @@ def summarize(out_dir: str, reference: Optional[tuple] = None, num_resamples: in
     ctrl = names.index("continue")
     get = lambda field, i: p2[field][i][report2]
     control_correct = get("correct_at_halt", ctrl)
+    before = p1["correct_at_n1"][pos][report2]  # correctness at step N1 of the retried puzzles
+    capture = lambda name, key: (lambda v: None if v is None else v[report2])(
+        _capture_field(out_dir, name, settings["ckpt_step"], key))
 
     summary = {"settings": settings, "split": {"selection_frac": frac, "seed": sseed, "report_puzzles": int(report1.sum()),
                                                 "retried_report_puzzles": R}}
@@ -475,7 +616,7 @@ def summarize(out_dir: str, reference: Optional[tuple] = None, num_resamples: in
     for i, name in enumerate(names):
         acc, cor, steps = get("accepted", i), get("correct_at_halt", i), get("halt_step", i).astype(np.int64)
         variant, scale, seed = _parse(name)
-        entry = {"branch": name, "variant": variant, "scale": scale, "seed": seed,
+        entry = {"branch": name, "variant": variant, "scale": scale, "seed": seed, "attempt_steps": attempt[i],
                  **_outcome_stats(acc, cor, steps),
                  "realized_scale_z_H": float(np.mean(get("realized_scale_z_H", i))) if R else None,
                  "realized_scale_z_L": float(np.mean(get("realized_scale_z_L", i))) if R else None,
@@ -484,13 +625,22 @@ def summarize(out_dir: str, reference: Optional[tuple] = None, num_resamples: in
         branches.append(entry)
     summary["branches"] = branches
 
+    control_steps = capture("continue", "seq_is_correct")
+    summary["control_solving_rate"] = None if control_steps is None or not R else \
+        step_rates(before, control_steps[None], first_step=n1 + 1)
+    control_hash = capture("continue", "pred_hash")
+    phase1_hash = p2["phase1_pred_hash"][report2] if "phase1_pred_hash" in p2 else None
+
     groups = []
-    for variant, scale in dict.fromkeys((b["variant"], b["scale"]) for b in branches if b["variant"] != "continue"):
-        members = [i for i, b in enumerate(branches) if (b["variant"], b["scale"]) == (variant, scale)]
+    keys = dict.fromkeys((b["variant"], b["scale"], b["attempt_steps"]) for b in branches if b["variant"] != "continue")
+    for variant, scale, length in keys:
+        members = [i for i, b in enumerate(branches) if (b["variant"], b["scale"], b["attempt_steps"]) == (variant, scale, length)]
         per_seed = [branches[i] for i in members]
+        K = len(members)
         stat = lambda f: {"mean": float(np.mean([f(b) for b in per_seed])), "min": float(np.min([f(b) for b in per_seed])),
                           "max": float(np.max([f(b) for b in per_seed]))}
-        g = {"variant": variant, "scale": scale, "seeds": [b["seed"] for b in per_seed],
+        g = {"variant": variant, "scale": scale, "attempt_steps": length, "attempts": K, "seeds": [b["seed"] for b in per_seed],
+             "branches": [names[i] for i in members], "budget": n1 + K * length, "control_budget": n1 + n2,
              "across_seeds": {k: stat(lambda b, k=k: b[k] or 0) for k in
                               ("solved_share", "accepted", "false_acceptances", "mean_steps")},
              "difference_from_control": stat(lambda b: b["paired_with_control"]["difference"] or 0),
@@ -498,21 +648,38 @@ def summarize(out_dir: str, reference: Optional[tuple] = None, num_resamples: in
              "overall_avg_steps": stat(lambda b: b["overall"]["avg_steps"] or 0)}
         cor_all = np.stack([get("correct_at_halt", i) for i in members])
         g["any_seed_oracle"] = {
-            "note": f"uses ground truth to pick among {len(members)} attempts, each with {n2} extra steps: an upper bound, "
+            "note": f"uses ground truth to pick among {K} attempts, each with {length} extra steps: an upper bound, "
                     "not a deployable strategy",
             "solved": int(cor_all.any(axis=0).sum()), "solved_share": float(cor_all.any(axis=0).mean()) if R else None}
         acc_s, cor_s, steps_s, first = sequential(np.stack([get("accepted", i) for i in members]),
                                                   np.stack([get("halt_step", i) for i in members]).astype(np.int64),
-                                                  cor_all, n1, n2)
+                                                  cor_all, n1, length)
         full = sequential(np.stack([p2["accepted"][i] for i in members]), np.stack([p2["halt_step"][i] for i in members]).astype(np.int64),
-                          np.stack([p2["correct_at_halt"][i] for i in members]), n1, n2)
+                          np.stack([p2["correct_at_halt"][i] for i in members]), n1, length)
+        same = "the same total budget as" if K * length == n2 else f"a different budget ({K * length} steps) from"
         g["sequential"] = {
             "note": f"seeds tried in order {g['seeds']}; the first answer the head accepts is kept, otherwise the last "
-                    f"attempt's; steps count every attempt (up to {n1 + len(members) * n2} per puzzle)",
+                    f"attempt's; steps count every attempt (up to {n1 + K * length} per puzzle, {same} the control)",
             **_outcome_stats(acc_s, cor_s, steps_s),
-            "attempts_used": np.bincount(first + 1, minlength=len(members) + 1)[1:].tolist(),
+            "attempts_used": np.bincount(first + 1, minlength=K + 1)[1:].tolist(),
             "paired_with_control": paired(cor_s, control_correct, num_resamples, rng),
             "overall": overall(full[1], full[2])}
+
+        # Solving rate by step within the attempt, pooled over attempts
+        steps_all = [capture(names[i], "seq_is_correct") for i in members]
+        g["solving_rate"] = None if any(s is None for s in steps_all) or not R else \
+            step_rates(before, np.stack(steps_all), first_step=1, exact=(K == 1))
+
+        # Diversity of the attempts' last grids; "unperturbed": the same steps without noise
+        if "final_pred_hash" in p2:
+            unperturbed, what = None, None
+            if variant == "noisy_restart" and phase1_hash is not None and length <= n1:
+                unperturbed, what = phase1_hash[:, length - 1], f"the grid of the plain run at step {length} (no noise)"
+            elif variant == "perturb" and control_hash is not None:
+                unperturbed, what = control_hash[:, length - 1], f"the control's grid at step {n1 + length}"
+            g["diversity"] = diversity(np.stack([get("final_pred_hash", i) for i in members]), unperturbed)
+            if what:
+                g["diversity"]["same_as_unperturbed"]["unperturbed"] = what
         groups.append(g)
     summary["groups"] = groups
 
@@ -531,20 +698,20 @@ def summarize(out_dir: str, reference: Optional[tuple] = None, num_resamples: in
 def _parse(name: str):
     if name == "continue":
         return "continue", 0.0, None
-    m = re.fullmatch(r"(.+)_s([^_]+)_seed(-?\d+)", name)
+    m = re.fullmatch(r"(.+)_s([^_]+?)(?:_a\d+)?_seed(-?\d+)", name)
     if not m:
         raise ValueError(f"unexpected branch name {name}")
     return m.group(1), float(m.group(2)), int(m.group(3))
 
 
 def reference_results(out_dir, settings, reference, p1, p2, report1, pos, report2, groups, names, num_resamples, rng) -> dict:
-    """Checks against a plain capture, and plain continuation to the same budgets."""
+    """Checks against a plain capture, and plain continuation to the budgets it covers."""
     n1, n2 = settings["n1"], settings["n2"]
     ref_dir, ref_step = reference
     data, _ = es.load(ref_dir, int(ref_step))
     S = data["seq_is_correct"].shape[1]
-    if S < n1 + n2:
-        raise ValueError(f"the reference capture has {S} steps; at least N1 + N2 = {n1 + n2} are needed")
+    if S < n1:
+        raise ValueError(f"the reference capture has {S} steps; at least N1 = {n1} are needed")
     kr = _key(data["set_id"], data["example_index"])
     k1 = _key(p1["set_id"], p1["example_index"])
     rows = np.searchsorted(kr, k1)
@@ -563,9 +730,11 @@ def reference_results(out_dir, settings, reference, p1, p2, report1, pos, report
 
     # Control against steps N1 + 1 ... N1 + N2
     control_dir = os.path.join(out_dir, "captures", "continue")
-    if not os.path.isdir(control_dir):
+    cap = None
+    if S < n1 + n2:
+        out["control_check"] = f"not available: the reference capture has {S} steps, fewer than N1 + N2 = {n1 + n2}"
+    elif not os.path.isdir(control_dir):
         out["control_check"] = f"not available: {control_dir} not found"
-        cap = None
     else:
         cap, _ = es.load(control_dir, settings["ckpt_step"])
     rr = rows[pos]
@@ -581,7 +750,7 @@ def reference_results(out_dir, settings, reference, p1, p2, report1, pos, report
         out["control_check"] = check
 
     # Plain continuation (halting by the same head) to each budget N1 + k * N2 the capture covers
-    k_max = max([len(g["seeds"]) for g in groups] + [1])
+    k_max = max([-(-g["attempts"] * g["attempt_steps"] // n2) for g in groups] + [1])
     plain = []
     for k in range(1, k_max + 1):
         budget = n1 + k * n2
@@ -598,34 +767,34 @@ def reference_results(out_dir, settings, reference, p1, p2, report1, pos, report
     out["plain_continuation"] = plain
     # Fixed numbers of steps, no halting
     out["fixed_steps"] = [{"steps": s, "name": f"plain, {s} steps (no halting)", "accuracy": float(correct[report1, s - 1].mean())}
-                          for s in sorted({n1, n1 + n2, S} | {n1 + k * n2 for k in range(1, k_max + 1) if n1 + k * n2 <= S})]
+                          for s in sorted({n1, n1 + n2, S} | {n1 + k * n2 for k in range(1, k_max + 1)}) if s <= S]
 
     # Sequential strategy against plain continuation with the same budget, on the retried puzzles
     retried_rows = np.flatnonzero(report1 & ~p1["accepted"])
     for g in groups:
-        budget = n1 + len(g["seeds"]) * n2
+        budget = g["budget"]
         if budget > S:
             continue
         h = es.halting_steps(logits[retried_rows, :budget], thr)
         c_plain = correct[retried_rows][np.arange(len(h)), h - 1]
-        members = [i for i, name in enumerate(names) if _parse(name)[:2] == (g["variant"], g["scale"])]
+        members = [names.index(name) for name in g["branches"]]
         _, cor_s, _, _ = sequential(np.stack([p2["accepted"][i][report2] for i in members]),
                                     np.stack([p2["halt_step"][i][report2] for i in members]).astype(np.int64),
-                                    np.stack([p2["correct_at_halt"][i][report2] for i in members]), n1, n2)
+                                    np.stack([p2["correct_at_halt"][i][report2] for i in members]), n1, g["attempt_steps"])
         g["sequential"]["paired_with_plain_same_budget"] = {"budget": budget, **paired(cor_s, c_plain, num_resamples, rng)}
     return out
 
 
-CSV_COLUMNS = ["kind", "variant", "scale", "seed", "retried", "accepted", "accepted_correct", "false_acceptances", "solved",
-               "solved_share", "mean_steps", "both", "variant_only", "control_only", "neither", "difference",
-               "difference_ci_low", "difference_ci_high", "overall_accuracy", "overall_avg_steps"]
+CSV_COLUMNS = ["kind", "variant", "scale", "seed", "attempt_steps", "attempts", "retried", "accepted", "accepted_correct",
+               "false_acceptances", "solved", "solved_share", "mean_steps", "both", "variant_only", "control_only", "neither",
+               "difference", "difference_ci_low", "difference_ci_high", "overall_accuracy", "overall_avg_steps"]
 
 
 def write_csv(path: str, summary: dict):
     rows = []
 
-    def row(kind, variant, scale, seed, stats, pair, overall):
-        r = {"kind": kind, "variant": variant, "scale": scale, "seed": seed,
+    def row(kind, variant, scale, seed, attempt_steps, attempts, stats, pair, overall):
+        r = {"kind": kind, "variant": variant, "scale": scale, "seed": seed, "attempt_steps": attempt_steps, "attempts": attempts,
              **{k: stats.get(k) for k in ("retried", "accepted", "accepted_correct", "false_acceptances", "solved",
                                           "solved_share", "mean_steps")}}
         if pair:
@@ -637,12 +806,13 @@ def write_csv(path: str, summary: dict):
         rows.append(r)
 
     for b in summary["branches"]:
-        row("seed", b["variant"], b["scale"], b["seed"], b, b["paired_with_control"], b["overall"])
+        row("seed", b["variant"], b["scale"], b["seed"], b.get("attempt_steps"), 1, b, b["paired_with_control"], b["overall"])
     for g in summary["groups"]:
         s = g["sequential"]
-        row("sequential", g["variant"], g["scale"], "+".join(map(str, g["seeds"])), s, s["paired_with_control"], s["overall"])
+        row("sequential", g["variant"], g["scale"], "+".join(map(str, g["seeds"])), g.get("attempt_steps"), g.get("attempts"),
+            s, s["paired_with_control"], s["overall"])
     for p in summary.get("reference", {}).get("plain_continuation", []):
-        row("plain", "plain", None, None, p, None, p["overall"])
+        row("plain", "plain", None, None, None, None, p, None, p["overall"])
     with open(path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
         w.writeheader()
@@ -654,14 +824,20 @@ def print_summary(summary: dict):
     print(f"Report split: {sp['report_puzzles']} puzzles; phase 1 accepted {p1['accepted']} "
           f"({p1['false_acceptances']} wrongly); retried {p1['retried']}")
     ctrl = next(b for b in summary["branches"] if b["variant"] == "continue")
+    if not ctrl["retried"]:
+        return
     print(f"  control: solved {ctrl['solved']}/{ctrl['retried']} ({ctrl['solved_share']:.4f}), "
           f"overall accuracy {ctrl['overall']['accuracy']:.4f}, avg steps {ctrl['overall']['avg_steps']:.2f}")
     for g in summary["groups"]:
         a, d, s = g["across_seeds"]["solved_share"], g["difference_from_control"], g["sequential"]
-        print(f"  {g['variant']} {g['scale']:g}: solved {a['mean']:.4f} [{a['min']:.4f}, {a['max']:.4f}] "
-              f"(vs control {d['mean']:+.4f}); sequential {s['solved_share']:.4f}, mean steps {s['mean_steps']:.1f}, "
-              f"overall {s['overall']['accuracy']:.4f} @ {s['overall']['avg_steps']:.2f}; "
-              f"any seed (oracle) {g['any_seed_oracle']['solved_share']:.4f}")
+        p = s["paired_with_control"]
+        ci = p.get("difference_ci")
+        div = g.get("diversity")
+        print(f"  {g['variant']} {g['scale']:g}, {g['attempts']} x {g['attempt_steps']} steps: one attempt solves "
+              f"{a['mean']:.4f} [{a['min']:.4f}, {a['max']:.4f}]; sequential {s['solved_share']:.4f} "
+              f"({s['false_acceptances']} false), mean steps {s['mean_steps']:.1f}, vs control {p['difference']:+.4f}"
+              + (f" [{ci[0]:+.4f}, {ci[1]:+.4f}]" if ci else "")
+              + (f"; distinct final grids {div['distinct_final_grids']['mean']:.2f} of {div['attempts']}" if div else ""))
     ref = summary.get("reference")
     if ref:
         c = ref["control_check"]
@@ -723,8 +899,13 @@ def main(argv=None):
     r.add_argument("--threshold", type=float, default=DEFAULTS["threshold"])
     r.add_argument("--perturb-scales", type=float, nargs="*", default=DEFAULTS["perturb_scales"])
     r.add_argument("--restart-scales", type=float, nargs="*", default=DEFAULTS["restart_scales"])
-    r.add_argument("--seeds", type=int, nargs="+", default=DEFAULTS["seeds"])
-    r.add_argument("--max-puzzles", type=int, default=None, help="only the first N test puzzles (quick trials)")
+    r.add_argument("--seeds", type=int, nargs="+", default=None,
+                   help=f"one attempt of N2 steps per seed (default {DEFAULTS['seeds']}); not with --attempt-steps")
+    r.add_argument("--attempt-steps", type=int, nargs="+", default=None, metavar="A",
+                   help="noisy attempts of A steps, N2 / A of them per scale (seeds 0 ... N2/A - 1); A must divide N2")
+    r.add_argument("--max-puzzles", type=int, default=None, help="a random sample of N test puzzles")
+    r.add_argument("--sample-seed", type=int, default=DEFAULTS["sample_seed"],
+                   help="seed of the --max-puzzles sample (the same seed gives the same puzzles for every checkpoint)")
     r.add_argument("--batch-size", type=int, default=None, help="default: the checkpoint run's global_batch_size")
     s = sub.add_parser("summarize", help="recompute summary.json / summary.csv from a finished run")
     s.add_argument("out_dir")
@@ -739,13 +920,21 @@ def main(argv=None):
     if a.command == "run":
         if os.path.abspath(a.out_dir) == os.path.dirname(os.path.abspath(a.ckpt)):
             p.error("out_dir must not be the checkpoint's directory")
+        if a.attempt_steps and a.seeds is not None:
+            p.error("--seeds and --attempt-steps are exclusive: with --attempt-steps the seeds are 0 ... N2/A - 1")
         settings = Settings(n1=a.n1, n2=a.n2, head=a.head, threshold=a.threshold, perturb_scales=a.perturb_scales,
-                            restart_scales=a.restart_scales, seeds=a.seeds)
+                            restart_scales=a.restart_scales,
+                            seeds=[] if a.attempt_steps else (a.seeds if a.seeds is not None else list(DEFAULTS["seeds"])),
+                            attempt_steps=a.attempt_steps or [])
+        try:
+            settings.branches()
+        except ValueError as e:
+            p.error(str(e))
         model, loader, set_names, set_sizes, batch_size = load_model_and_data(a.ckpt, settings, a.batch_size)
         settings.chunk_size = batch_size
         m = re.fullmatch(r"step_(\d+)", os.path.basename(a.ckpt))
         run_experiment(model, loader, settings, a.out_dir, set_names, set_sizes, int(m.group(1)) if m else 0,
-                       max_puzzles=a.max_puzzles,
+                       max_puzzles=a.max_puzzles, sample_seed=a.sample_seed,
                        extra_settings={"ckpt": a.ckpt, "selection_frac": a.selection_frac, "split_seed": a.split_seed})
     summarize(a.out_dir, a.reference, a.bootstrap, a.selection_frac, a.split_seed)
 

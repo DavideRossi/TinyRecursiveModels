@@ -3,8 +3,9 @@
 # Submit from the repo root:
 #   CKPT=checkpoints/<project>/<run>/step_<N> OUT=<output directory> \
 #     sbatch slurm/restarts_sudoku.sbatch [options of experiments/restarts.py run]
-# e.g. a quick trial on the first 5000 puzzles:
+# e.g. a quick trial on a random sample of 5000 puzzles:
 #   ... sbatch --time=01:00:00 slurm/restarts_sudoku.sbatch --max-puzzles 5000
+# short noisy restarts (8 x 4 and 4 x 8 steps) against 32 steps of continuation: see slurm/README.md, section 9
 # or the full run, checked against the plain 128-step capture:
 #   ... sbatch slurm/restarts_sudoku.sbatch --reference <dir of the 128-step capture> <N>
 #
