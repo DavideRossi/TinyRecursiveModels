@@ -27,3 +27,9 @@ no_ACT_continue: True # No continue ACT loss, only use the sigmoid of the halt w
 # Auxiliary halting heads (observers trained on detached state; see models/aux_halt_heads.py)
 # e.g. arch.aux_halt_heads=[{type:detached_linear}]
 aux_halt_heads: []
+# Supervised window at random depth (training only; see the model config): with probability
+# halt_warmup_prob a sequence first runs s warm-up steps without loss or halting,
+# s uniform in [halt_warmup_min, halt_warmup_max] (null: halt_max_steps). 0 = off.
+halt_warmup_prob: 0.0
+halt_warmup_min: 1
+halt_warmup_max: null

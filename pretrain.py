@@ -1,4 +1,4 @@
-from typing import Optional, Any, Sequence, List
+from typing import Optional, Any, Sequence, List, Dict
 from dataclasses import dataclass
 import os
 import re
@@ -23,6 +23,7 @@ from models.adam_atan2 import AdamATan2
 from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMetadata
 from utils.functions import load_model_class, get_model_source_path
 from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
+from models.losses import METRIC_DENOMINATORS, METRIC_MAX
 from models.ema import EMAHelper
 from utils.eval_loop import run_eval_batch
 
@@ -156,6 +157,8 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
     with torch.device("cuda"):
         model: nn.Module = model_cls(model_cfg)
         print(model)
+        if model_cfg.get("halt_warmup_prob", 0.0) > 0 and "halt_warmup_prob" not in type(model.config).model_fields:  # type: ignore
+            raise ValueError(f"{config.arch.name} does not support halt_warmup_prob (supervised window at random depth)")
         model = loss_head_cls(model, **config.arch.loss.__pydantic_extra__)  # type: ignore
         if "DISABLE_COMPILE" not in os.environ:
             model = torch.compile(model)  # type: ignore
@@ -337,6 +340,25 @@ def create_evaluators(config: PretrainConfig, eval_metadata: PuzzleDatasetMetada
 
     return evaluators
 
+def postprocess_train_metrics(reduced: Dict[str, Any], global_batch_size: int) -> Dict[str, Any]:
+    """Sums over the batch (and ranks) -> logged values: losses per sequence of the global batch,
+    metrics in METRIC_DENOMINATORS divided by their own count (omitted when that count is 0; the
+    counts themselves are not logged), everything else per halted sequence ("count")."""
+    count = max(reduced["count"], 1)  # Avoid NaNs
+    denominators = set(METRIC_DENOMINATORS.values())
+    out = {}
+    for k, v in reduced.items():
+        if k in denominators:
+            continue
+        if k in METRIC_DENOMINATORS:
+            den = reduced[METRIC_DENOMINATORS[k]]
+            if den > 0:
+                out[f"train/{k}"] = v / den
+            continue
+        out[f"train/{k}"] = v / (global_batch_size if k.endswith("loss") else count)
+    return out
+
+
 def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, global_batch_size: int, rank: int, world_size: int):
     train_state.step += 1
     if train_state.step > train_state.total_steps:  # At most train_total_steps
@@ -376,6 +398,14 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
     if len(metrics):
         assert not any(v.requires_grad for v in metrics.values())
 
+        # Maxima (supervised window at random depth) are reduced with a max, not a sum
+        max_metrics = {k: metrics.pop(k) for k in sorted(METRIC_MAX) if k in metrics}
+        max_values = None
+        if len(max_metrics):
+            max_values = torch.stack([v.to(torch.float64) for v in max_metrics.values()])
+            if world_size > 1:
+                dist.reduce(max_values, dst=0, op=dist.ReduceOp.MAX)
+
         metric_keys = list(sorted(metrics.keys()))  # Sort keys to guarantee all processes use the same order.
         # Reduce and reconstruct
         metric_values = torch.stack([metrics[k] for k in metric_keys])
@@ -387,8 +417,9 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             reduced_metrics = {k: metric_values[i] for i, k in enumerate(metric_keys)}
             
             # Postprocess
-            count = max(reduced_metrics["count"], 1)  # Avoid NaNs
-            reduced_metrics = {f"train/{k}": v / (global_batch_size if k.endswith("loss") else count) for k, v in reduced_metrics.items()}
+            reduced_metrics = postprocess_train_metrics(reduced_metrics, global_batch_size)
+            if max_values is not None:
+                reduced_metrics.update({f"train/{k}": v for k, v in zip(max_metrics, max_values.cpu().numpy())})
 
             reduced_metrics["train/lr"] = lr_this_step
             return reduced_metrics
@@ -617,6 +648,11 @@ def save_code_and_config(config: PretrainConfig):
     wandb.run.log_code(config.checkpoint_path)
 
 
+# arch settings that only change training (evaluation ignores them): not compared with the
+# checkpoint's settings in evaluation-only runs
+TRAINING_ONLY_ARCH_KEYS = {"halt_warmup_prob", "halt_warmup_min", "halt_warmup_max"}
+
+
 def check_eval_only_config(config: PretrainConfig):
     """Evaluation-only runs: refuse setups that would silently evaluate something else."""
     if config.load_checkpoint is None:
@@ -634,7 +670,8 @@ def check_eval_only_config(config: PretrainConfig):
         with open(saved_config_file, "rt") as f:
             saved_arch = yaml.safe_load(f).get("arch", {})
         arch = config.arch.model_dump()
-        diff = {k: (saved_arch.get(k), arch.get(k)) for k in sorted(set(saved_arch) | set(arch)) if saved_arch.get(k) != arch.get(k)}
+        diff = {k: (saved_arch.get(k), arch.get(k)) for k in sorted(set(saved_arch) | set(arch))
+                if saved_arch.get(k) != arch.get(k) and k not in TRAINING_ONLY_ARCH_KEYS}
         if diff:
             raise ValueError(f"arch settings differ from {saved_config_file} (saved, now): {diff}")
     else:

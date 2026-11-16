@@ -29,6 +29,10 @@ class TinyRecursiveReasoningModel_ACTV1Carry:
     
     current_data: Dict[str, torch.Tensor]
 
+    # Supervised window at random depth: per sequence, the number of warm-up steps before its
+    # supervised window (0: none). Only ever non-zero in training with halt_warmup_prob > 0.
+    warmup: Optional[torch.Tensor] = None
+
 
 class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     batch_size: int
@@ -68,6 +72,15 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
 
     # Auxiliary halting heads: trained on detached state, never used for halting (see models/aux_halt_heads.py)
     aux_halt_heads: List[AuxHaltHeadConfig] = []
+
+    # Supervised window at random depth (training only). With probability halt_warmup_prob, a
+    # sequence loaded into a slot first runs s warm-up steps, s uniform in
+    # [halt_warmup_min, halt_warmup_max] (None: halt_max_steps): no loss, no halting. Its supervised
+    # window follows, with the usual halting rules counted from the window's start, so the sequence
+    # runs at most s + halt_max_steps steps. 0 = off: no extra random numbers are drawn.
+    halt_warmup_prob: float = 0.0
+    halt_warmup_min: int = 1
+    halt_warmup_max: Optional[int] = None
 
 class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
     def __init__(self, config: TinyRecursiveReasoningModel_ACTV1Config) -> None:
@@ -252,7 +265,23 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
     def __init__(self, config_dict: dict):
         super().__init__()
         self.config = TinyRecursiveReasoningModel_ACTV1Config(**config_dict)
+        if not 0.0 <= self.config.halt_warmup_prob <= 1.0:
+            raise ValueError(f"halt_warmup_prob must be in [0, 1], got {self.config.halt_warmup_prob}")
+        if self.config.halt_warmup_prob > 0:
+            if not 1 <= self.config.halt_warmup_min <= self.warmup_max:
+                raise ValueError(f"warm-up range must satisfy 1 <= halt_warmup_min <= halt_warmup_max, "
+                                 f"got [{self.config.halt_warmup_min}, {self.warmup_max}]")
         self.inner = TinyRecursiveReasoningModel_ACTV1_Inner(self.config)
+
+    @property
+    def warmup_max(self) -> int:
+        return self.config.halt_warmup_max if self.config.halt_warmup_max is not None else self.config.halt_max_steps
+
+    @property
+    def warmup_enabled(self) -> bool:
+        """Warm-up is drawn only in training with halt_warmup_prob > 0 (a Python-level check:
+        otherwise no random numbers are consumed and the carry's warm-up stays 0)."""
+        return self.training and self.config.halt_warmup_prob > 0
 
     @property
     def puzzle_emb(self):
@@ -267,7 +296,9 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
             steps=torch.zeros((batch_size, ), dtype=torch.int32),
             halted=torch.ones((batch_size, ), dtype=torch.bool),  # Default to halted
             
-            current_data={k: torch.empty_like(v) for k, v in batch.items()}
+            current_data={k: torch.empty_like(v) for k, v in batch.items()},
+
+            warmup=torch.zeros((batch_size, ), dtype=torch.int32),
         )
         
     def forward(self, carry: TinyRecursiveReasoningModel_ACTV1Carry, batch: Dict[str, torch.Tensor]) -> Tuple[TinyRecursiveReasoningModel_ACTV1Carry, Dict[str, torch.Tensor]]:
@@ -276,6 +307,17 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
         new_inner_carry = self.inner.reset_carry(carry.halted, carry.inner_carry)
         
         new_steps = torch.where(carry.halted, 0, carry.steps)
+
+        # Warm-up length of each sequence: drawn when a new sequence is loaded into its slot
+        warmup = carry.warmup if carry.warmup is not None else torch.zeros_like(carry.steps)
+        if self.warmup_enabled:
+            with torch.no_grad():
+                draw = torch.rand(carry.steps.shape, device=carry.steps.device) < self.config.halt_warmup_prob
+                length = torch.randint(self.config.halt_warmup_min, self.warmup_max + 1, carry.steps.shape,
+                                       device=carry.steps.device, dtype=carry.steps.dtype)
+                warmup = torch.where(carry.halted, torch.where(draw, length, 0), warmup)
+        elif not self.training:
+            warmup = torch.zeros_like(carry.steps)
 
         new_current_data = {k: torch.where(carry.halted.view((-1, ) + (1, ) * (batch[k].ndim - 1)), batch[k], v) for k, v in carry.current_data.items()}
 
@@ -294,10 +336,12 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
         with torch.no_grad():
             # Step
             new_steps = new_steps + 1
+            # Steps of the supervised window (= new_steps without warm-up; <= 0 during warm-up)
+            window_steps = new_steps - warmup
             max_steps = self.config.halt_max_steps
             if not self.training and self.config.eval_halt_max_steps is not None:
                 max_steps = self.config.eval_halt_max_steps
-            is_last_step = new_steps >= max_steps
+            is_last_step = window_steps >= max_steps
             
             halted = is_last_step
 
@@ -314,7 +358,11 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
 
                 # Exploration
                 min_halt_steps = (torch.rand_like(q_halt_logits) < self.config.halt_exploration_prob) * torch.randint_like(new_steps, low=2, high=self.config.halt_max_steps + 1)
-                halted = halted & (new_steps >= min_halt_steps)
+                halted = halted & (window_steps >= min_halt_steps)
+
+                # No halting during warm-up, whatever the halt head says
+                if self.config.halt_warmup_prob > 0:
+                    halted = halted & (window_steps >= 1)
 
                 if not self.config.no_ACT_continue:
                     # Compute target Q
@@ -324,4 +372,4 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
                     _, _, (next_q_halt_logits, next_q_continue_logits), _ = self.inner(new_inner_carry, new_current_data)
                     outputs["target_q_continue"] = torch.sigmoid(torch.where(is_last_step, next_q_halt_logits, torch.maximum(next_q_halt_logits, next_q_continue_logits)))
 
-        return TinyRecursiveReasoningModel_ACTV1Carry(new_inner_carry, new_steps, halted, new_current_data), outputs
+        return TinyRecursiveReasoningModel_ACTV1Carry(new_inner_carry, new_steps, halted, new_current_data, warmup), outputs

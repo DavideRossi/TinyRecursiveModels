@@ -259,6 +259,39 @@ SIF=/scratch.hpc/$USER/trm-<branch>.sif RUN_NAME=sudoku_aux_linear \
 The first run of a branch that changes model code is a good time for one of the
 quick checks of section 4.
 
+### Supervised window at random depth
+
+`arch.halt_warmup_prob=p` (TRM only; default 0, off) gives a training sequence,
+with probability p, `s` warm-up steps before its supervised window, with `s`
+uniform in `[arch.halt_warmup_min, arch.halt_warmup_max]` (default 1 and
+`halt_max_steps`). During warm-up the sequence runs normally but has no loss and
+cannot halt. Its window then follows the usual halting rules, counted from the
+window's start, so it runs at most `s + halt_max_steps` steps. Evaluation is
+unaffected, and evaluation-only runs don't compare these settings with the
+checkpoint's.
+
+The losses are still divided by `global_batch_size`, so the gradient shrinks by
+the share of supervised sequence-steps (`train/supervised_share`). AdamATan2 and
+the sign-SGD of the puzzle embeddings ignore a constant scale: the effect is a
+smaller effective batch, not smaller updates. `train/*_loss` drops by the same
+share. Other training metrics with the option on:
+
+| Metric | Meaning |
+|---|---|
+| `train/supervised_share` | supervised sequence-steps / sequences in the batch |
+| `train/supervised_depth_mean`, `_max` | step counted from the sequence's start, over supervised steps |
+| `train/warmup_solved_share` | of the sequences at their last warm-up step, the share already solved |
+| `train/steps`, `train/steps_total` | steps of halted sequences: window steps / from the start (always logged) |
+
+Example: the 4-step run of this branch with warm-up (p = 0.2, s in 1–12):
+
+```bash
+SIF=/scratch.hpc/$USER/trm-modern.sif RUN_NAME=sudoku_aux_linear_hms4_warmup \
+  sbatch slurm/train_sudoku.sbatch \
+  'arch.aux_halt_heads=[{type:detached_linear}]' eval_capture_steps=True \
+  arch.halt_max_steps=4 arch.halt_warmup_prob=0.2 arch.halt_warmup_min=1 arch.halt_warmup_max=12
+```
+
 ## 8. Evaluate an existing checkpoint
 
 `eval_sudoku.sbatch` runs only the evaluation of a saved checkpoint, with any

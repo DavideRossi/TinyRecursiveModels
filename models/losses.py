@@ -54,6 +54,39 @@ def compute_correctness(preds: torch.Tensor, labels: torch.Tensor):
 
 AUX_HALT_LOGITS_KEY = "aux_halt_logits"
 
+# Training metrics of the supervised window at random depth, reduced by pretrain.train_batch with
+# their own denominators (another metric of the same batch, summed over ranks; the denominator keys
+# are not logged themselves) or with a maximum over ranks instead of a sum.
+METRIC_DENOMINATORS = {
+    "supervised_share": "batch_count",          # supervised sequence-steps / sequences in the batch
+    "supervised_depth_mean": "supervised_count",  # step counted from the sequence's start, supervised steps
+    "warmup_solved_share": "warmup_end_count",  # solved at the last warm-up step / sequences at that step
+}
+METRIC_MAX = {"supervised_depth_max"}
+
+
+def supervised_mask(carry) -> Optional[torch.Tensor]:
+    """[B] bool: sequences in their supervised window at this step, or None when no sequence of the
+    carry has a warm-up (carries without the field, or all-zero only by construction: see callers)."""
+    warmup = getattr(carry, "warmup", None)
+    if warmup is None:
+        return None
+    return carry.steps > warmup
+
+
+def masked_sum(x: torch.Tensor, supervised: Optional[torch.Tensor]) -> torch.Tensor:
+    """Sum of per-sequence ([B]) or per-cell ([B, L]) terms over supervised sequences. The masked
+    terms are replaced by an exact 0 (torch.where), so they contribute nothing to the gradients."""
+    if supervised is None:
+        return x.sum()
+    return torch.where(supervised.view((-1, ) + (1, ) * (x.ndim - 1)), x, 0).sum()
+
+
+def _bce_sum(logits: torch.Tensor, targets: torch.Tensor, supervised: Optional[torch.Tensor]) -> torch.Tensor:
+    if supervised is None:
+        return F.binary_cross_entropy_with_logits(logits, targets, reduction="sum")
+    return masked_sum(F.binary_cross_entropy_with_logits(logits, targets, reduction="none"), supervised)
+
 
 class ACTLossHead(nn.Module):
     def __init__(self, model: nn.Module, loss_type: str):
@@ -75,6 +108,13 @@ class ACTLossHead(nn.Module):
         new_carry, outputs = self.model(**model_kwargs)
         labels = new_carry.current_data["labels"]
 
+        # Supervised window at random depth: warm-up steps contribute no loss. None when the option
+        # is off (the loss is then computed exactly as without the option).
+        warmup_on = self.training and getattr(getattr(self.model, "config", None), "halt_warmup_prob", 0.0) > 0
+        supervised = supervised_mask(new_carry) if warmup_on else None
+        warmup = getattr(new_carry, "warmup", None)
+        window_steps = new_carry.steps - warmup if warmup is not None else new_carry.steps
+
         with torch.no_grad():
             # Preds
             outputs["preds"] = torch.argmax(outputs["logits"], dim=-1)
@@ -83,7 +123,8 @@ class ACTLossHead(nn.Module):
             mask, loss_counts, is_correct, seq_is_correct = compute_correctness(outputs["preds"], labels)
             loss_divisor = loss_counts.clamp_min(1).unsqueeze(-1)  # Avoid NaNs in division
             
-            # Metrics (halted)
+            # Metrics (halted). Sequences halt only inside their supervised window, so these count
+            # supervised steps only. "steps" counts window steps, "steps_total" steps from the start.
             valid_metrics = new_carry.halted & (loss_counts > 0)
             metrics = {
                 "count": valid_metrics.sum(),
@@ -92,8 +133,23 @@ class ACTLossHead(nn.Module):
                 "exact_accuracy": (valid_metrics & seq_is_correct).sum(),
 
                 "q_halt_accuracy": (valid_metrics & ((outputs["q_halt_logits"] >= 0) == seq_is_correct)).sum(),
-                "steps":          torch.where(valid_metrics, new_carry.steps, 0).sum(),
+                "steps":          torch.where(valid_metrics, window_steps, 0).sum(),
             }
+            if self.training:
+                metrics["steps_total"] = torch.where(valid_metrics, new_carry.steps, 0).sum()
+
+            if supervised is not None:
+                # Last warm-up step: the next step is the first of the window
+                warmup_end = (warmup > 0) & (window_steps == 0) & (loss_counts > 0)
+                metrics.update({
+                    "batch_count": torch.tensor(supervised.numel(), device=supervised.device),
+                    "supervised_share": supervised.sum(),
+                    "supervised_count": supervised.sum(),
+                    "supervised_depth_mean": torch.where(supervised, new_carry.steps, 0).sum(),
+                    "supervised_depth_max": torch.where(supervised, new_carry.steps, 0).max(),
+                    "warmup_end_count": warmup_end.sum(),
+                    "warmup_solved_share": (warmup_end & seq_is_correct).sum(),
+                })
 
             # Auxiliary halting heads: same accuracy definition as q_halt_accuracy
             aux_halt_logits: Dict[str, torch.Tensor] = outputs.get(AUX_HALT_LOGITS_KEY, {})
@@ -102,8 +158,10 @@ class ACTLossHead(nn.Module):
 
         # Losses
 
-        lm_loss = (self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask) / loss_divisor).sum()
-        q_halt_loss = F.binary_cross_entropy_with_logits(outputs["q_halt_logits"], seq_is_correct.to(outputs["q_halt_logits"].dtype), reduction="sum")
+        # Every term is summed over the (supervised) sequences of the batch; pretrain divides by the
+        # fixed global batch size, so masked sequences lower the gradient scale (no renormalization).
+        lm_loss = masked_sum(self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask) / loss_divisor, supervised)
+        q_halt_loss = _bce_sum(outputs["q_halt_logits"], seq_is_correct.to(outputs["q_halt_logits"].dtype), supervised)
         metrics.update({
             "lm_loss": lm_loss.detach(),
             "q_halt_loss": q_halt_loss.detach(),
@@ -111,7 +169,7 @@ class ACTLossHead(nn.Module):
         # Q continue (bootstrapping target loss); Alexia: This fits Q-learning, but seems totally unecessary
         q_continue_loss = 0
         if "target_q_continue" in outputs:
-            q_continue_loss = F.binary_cross_entropy_with_logits(outputs["q_continue_logits"], outputs["target_q_continue"], reduction="sum")
+            q_continue_loss = _bce_sum(outputs["q_continue_logits"], outputs["target_q_continue"], supervised)
 
             metrics["q_continue_loss"] = q_continue_loss.detach()
 
@@ -122,7 +180,7 @@ class ACTLossHead(nn.Module):
         if len(aux_halt_logits):
             aux_loss_total = 0
             for name, aux_logit in aux_halt_logits.items():
-                aux_loss = F.binary_cross_entropy_with_logits(aux_logit, seq_is_correct.to(aux_logit.dtype), reduction="sum")
+                aux_loss = _bce_sum(aux_logit, seq_is_correct.to(aux_logit.dtype), supervised)
                 metrics[f"aux_{name}_q_halt_loss"] = aux_loss.detach()
                 aux_loss_total = aux_loss_total + aux_loss
             total_loss = total_loss + 0.5 * aux_loss_total
