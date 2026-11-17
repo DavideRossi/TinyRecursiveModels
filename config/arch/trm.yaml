@@ -33,3 +33,5 @@ aux_halt_heads: []
 halt_warmup_prob: 0.0
 halt_warmup_min: 1
 halt_warmup_max: null
+# Release: a sequence solved at its last warm-up step halts there, without a supervised step
+halt_warmup_release: False

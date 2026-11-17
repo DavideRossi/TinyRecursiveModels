@@ -19,6 +19,8 @@ global_batch_size: 768
 
 epochs: 100000
 eval_interval: 10000
+# Train until this many supervised sequence-steps instead of for `epochs` (null: off; see PretrainConfig)
+train_supervised_target: null
 checkpoint_every_eval: True
 eval_capture_steps: False # per-step halt logits + correctness during eval (saved as step_<N>_eval_steps.<rank>)
 

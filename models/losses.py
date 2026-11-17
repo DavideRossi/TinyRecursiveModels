@@ -61,6 +61,7 @@ METRIC_DENOMINATORS = {
     "supervised_share": "batch_count",          # supervised sequence-steps / sequences in the batch
     "supervised_depth_mean": "supervised_count",  # step counted from the sequence's start, supervised steps
     "warmup_solved_share": "warmup_end_count",  # solved at the last warm-up step / sequences at that step
+    "warmup_released_share": "warmup_end_count",  # released at the last warm-up step / sequences at that step
 }
 METRIC_MAX = {"supervised_depth_max"}
 
@@ -123,9 +124,10 @@ class ACTLossHead(nn.Module):
             mask, loss_counts, is_correct, seq_is_correct = compute_correctness(outputs["preds"], labels)
             loss_divisor = loss_counts.clamp_min(1).unsqueeze(-1)  # Avoid NaNs in division
             
-            # Metrics (halted). Sequences halt only inside their supervised window, so these count
-            # supervised steps only. "steps" counts window steps, "steps_total" steps from the start.
-            valid_metrics = new_carry.halted & (loss_counts > 0)
+            # Metrics (halted). Only sequences halting inside their supervised window count: released
+            # sequences (halted at their last warm-up step) are left out. "steps" counts window steps,
+            # "steps_total" steps from the start.
+            valid_metrics = new_carry.halted & (loss_counts > 0) & (window_steps >= 1)
             metrics = {
                 "count": valid_metrics.sum(),
                 
@@ -150,6 +152,8 @@ class ACTLossHead(nn.Module):
                     "warmup_end_count": warmup_end.sum(),
                     "warmup_solved_share": (warmup_end & seq_is_correct).sum(),
                 })
+                if getattr(self.model.config, "halt_warmup_release", False):
+                    metrics["warmup_released_share"] = (warmup_end & new_carry.halted).sum()
 
             # Auxiliary halting heads: same accuracy definition as q_halt_accuracy
             aux_halt_logits: Dict[str, torch.Tensor] = outputs.get(AUX_HALT_LOGITS_KEY, {})

@@ -10,10 +10,13 @@ writing.
 By default only evaluation metrics are printed. Options:
     --train         also print training metrics (train/*), as a table with one
                     row per window of training steps, each value being the mean
-                    of the logged per-step values in that window. Metrics that
+                    of the logged per-step values in that window (the maximum
+                    for *_max metrics, the last value for the cumulative
+                    supervised count and the target progress). Metrics that
                     pretrain.py averages over the sequences halted in a step
-                    (everything but losses, lr and count) are averaged only
-                    over the steps in which some sequence halted.
+                    (everything but losses, lr, count and the supervised-window
+                    metrics) are averaged only over the steps in which some
+                    sequence halted.
     --window N      training steps per row (default 1000)
     --last K        only the last K rows of the training table
     --keys S [S...] only metrics whose name contains one of the substrings,
@@ -118,9 +121,24 @@ def fmt(v):
     return f"{v:.4g}" if isinstance(v, float) else str(v)
 
 
+# Supervised window at random depth: per batch, valid whether or not a sequence halted
+WINDOW_KEYS = ("train/supervised_share", "train/supervised_depth_mean", "train/supervised_depth_max",
+               "train/warmup_solved_share", "train/warmup_released_share",
+               "train/supervised_cumulative", "train/target_progress")
+LAST_VALUE_KEYS = ("train/supervised_cumulative", "train/target_progress")
+
+
 def per_halted_sequence(key):
     """pretrain.py divides these by the number of sequences halted in the step (0 if none)."""
-    return not (key.endswith("loss") or key in ("train/lr", "train/count"))
+    return not (key.endswith("loss") or key in ("train/lr", "train/count") or key in WINDOW_KEYS)
+
+
+def window_value(key, vals):
+    if key in LAST_VALUE_KEYS:
+        return vals[-1]
+    if key.endswith("_max"):
+        return max(vals)
+    return sum(vals) / len(vals)
 
 
 def print_train_table(train_rows, keys_filter, window, last):
@@ -149,14 +167,14 @@ def print_train_table(train_rows, keys_filter, window, last):
     names = [k[len("train/"):] for k in keys]
     widths = [max(len(n), 10) for n in names]
     step_w = len(f"{order[-1] * window + 1}-{(order[-1] + 1) * window}")
-    print(f"Training metrics, mean per {window} steps:")
+    print(f"Training metrics per {window} steps (mean; maximum for *_max; last value for cumulative counts):")
     print("    " + "steps".ljust(step_w) + "  " + "  ".join(n.rjust(w) for n, w in zip(names, widths)))
     for b in order:
         steps = f"{b * window + 1}-{(b + 1) * window}"
         cells = []
         for k, w in zip(keys, widths):
             vals = buckets[b].get(k)
-            cells.append((fmt(sum(vals) / len(vals)) if vals else "-").rjust(w))
+            cells.append((fmt(window_value(k, vals)) if vals else "-").rjust(w))
         print("    " + steps.ljust(step_w) + "  " + "  ".join(cells))
 
 

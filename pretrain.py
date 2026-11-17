@@ -2,6 +2,7 @@ from typing import Optional, Any, Sequence, List, Dict
 from dataclasses import dataclass
 import os
 import re
+import itertools
 import math
 import yaml
 import shutil
@@ -26,6 +27,7 @@ from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
 from models.losses import METRIC_DENOMINATORS, METRIC_MAX
 from models.ema import EMAHelper
 from utils.eval_loop import run_eval_batch
+from utils.supervised_budget import SupervisedBudget
 
 
 class LossConfig(pydantic.BaseModel):
@@ -104,6 +106,12 @@ class PretrainConfig(pydantic.BaseModel):
     # Only evaluate load_checkpoint (no training). The step is read from the file name (step_<N>).
     eval_only: bool = False
 
+    # Train until this many supervised sequence-steps (one sequence receiving a loss in one step;
+    # see utils/supervised_budget.py) instead of for `epochs`: the data keeps cycling in iterations
+    # of eval_interval epochs, evaluation and checkpoints run as usual plus once at the stopping
+    # step, and the cosine schedule ends exactly there. None: stop after `epochs`.
+    train_supervised_target: Optional[int] = None
+
     ema: bool = False # use Exponential-Moving-Average
     ema_rate: float = 0.999 # EMA-rate
     freeze_weights: bool = False # If True, freeze weights and only learn the embeddings
@@ -117,6 +125,10 @@ class TrainState:
 
     step: int
     total_steps: int
+
+    # Cumulative supervised sequence-steps (summed over ranks), and the stopping rule if any
+    supervised_total: int = 0
+    budget: Optional[SupervisedBudget] = None
 
 
 def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size: int, **kwargs):
@@ -257,7 +269,9 @@ def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetada
         model=model,
         optimizers=optimizers,
         optimizer_lrs=optimizer_lrs,
-        carry=None
+        carry=None,
+        budget=SupervisedBudget(config.train_supervised_target, config.lr_warmup_steps)
+               if config.train_supervised_target is not None else None,
     )
 
 
@@ -317,6 +331,9 @@ def load_checkpoint(model: nn.Module, config: PretrainConfig):
 
 
 def compute_lr(base_lr: float, config: PretrainConfig, train_state: TrainState):
+    if train_state.budget is not None:
+        # Cosine progress measured in supervised sequence-steps (utils/supervised_budget.py)
+        return train_state.budget.lr(base_lr, config.lr_min_ratio)
     return cosine_schedule_with_warmup_lr_lambda(
         current_step=train_state.step,
         base_lr=base_lr,
@@ -340,6 +357,10 @@ def create_evaluators(config: PretrainConfig, eval_metadata: PuzzleDatasetMetada
 
     return evaluators
 
+# Device of train_batch (tests run it on the CPU)
+TRAIN_DEVICE = "cuda"
+
+
 def postprocess_train_metrics(reduced: Dict[str, Any], global_batch_size: int) -> Dict[str, Any]:
     """Sums over the batch (and ranks) -> logged values: losses per sequence of the global batch,
     metrics in METRIC_DENOMINATORS divided by their own count (omitted when that count is 0; the
@@ -361,21 +382,34 @@ def postprocess_train_metrics(reduced: Dict[str, Any], global_batch_size: int) -
 
 def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, global_batch_size: int, rank: int, world_size: int):
     train_state.step += 1
-    if train_state.step > train_state.total_steps:  # At most train_total_steps
+    if train_state.budget is None and train_state.step > train_state.total_steps:  # At most train_total_steps
         return
 
     # To device
-    batch = {k: v.cuda() for k, v in batch.items()}
+    batch = {k: v.to(TRAIN_DEVICE) for k, v in batch.items()}
 
     # Init carry if it is None
     if train_state.carry is None:
-        with torch.device("cuda"):
+        with torch.device(TRAIN_DEVICE):
             train_state.carry = train_state.model.initial_carry(batch)  # type: ignore
 
     # Forward
     train_state.carry, loss, metrics, _, _ = train_state.model(carry=train_state.carry, batch=batch, return_keys=[])
 
     ((1 / global_batch_size) * loss).backward()
+
+    # Supervised sequence-steps of this step, over all ranks: every sequence of the (full) batch
+    # without warm-up; those in their supervised window with it
+    if "supervised_count" in metrics:
+        supervised = metrics["supervised_count"].detach().clone()
+        if world_size > 1:
+            dist.all_reduce(supervised)
+        supervised = int(supervised.item())
+    else:
+        supervised = int(global_batch_size)
+    train_state.supervised_total += supervised
+    if train_state.budget is not None:
+        train_state.budget.record(train_state.step, supervised)
 
     # Allreduce
     if world_size > 1:
@@ -420,6 +454,9 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             reduced_metrics = postprocess_train_metrics(reduced_metrics, global_batch_size)
             if max_values is not None:
                 reduced_metrics.update({f"train/{k}": v for k, v in zip(max_metrics, max_values.cpu().numpy())})
+            reduced_metrics["train/supervised_cumulative"] = train_state.supervised_total
+            if train_state.budget is not None:
+                reduced_metrics["train/target_progress"] = train_state.budget.fraction
 
             reduced_metrics["train/lr"] = lr_this_step
             return reduced_metrics
@@ -650,7 +687,7 @@ def save_code_and_config(config: PretrainConfig):
 
 # arch settings that only change training (evaluation ignores them): not compared with the
 # checkpoint's settings in evaluation-only runs
-TRAINING_ONLY_ARCH_KEYS = {"halt_warmup_prob", "halt_warmup_min", "halt_warmup_max"}
+TRAINING_ONLY_ARCH_KEYS = {"halt_warmup_prob", "halt_warmup_min", "halt_warmup_max", "halt_warmup_release"}
 
 
 def check_eval_only_config(config: PretrainConfig):
@@ -761,7 +798,8 @@ def launch(hydra_config: DictConfig):
     progress_bar = None
     ema_helper = None
     if RANK == 0:
-        progress_bar = tqdm.tqdm(total=train_state.total_steps)
+        # In supervised sequence-steps with a target, in optimizer steps otherwise
+        progress_bar = tqdm.tqdm(total=train_state.budget.target if train_state.budget is not None else train_state.total_steps)
         wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump(), settings=wandb.Settings(x_disable_stats=True))  # type: ignore
         wandb.log({"num_params": sum(x.numel() for x in train_state.model.parameters())}, step=0)
         save_code_and_config(config)
@@ -789,8 +827,16 @@ def launch(hydra_config: DictConfig):
         ema_helper = EMAHelper(mu=config.ema_rate)
         ema_helper.register(train_state.model)
 
-    # Training Loop
-    for _iter_id in range(total_iters):
+    # Training Loop. With a supervised target, iterations of train_epochs_per_iter epochs continue
+    # until the target is reached (epochs no longer bounds training).
+    budget = train_state.budget
+    if budget is not None and total_iters > 0:
+        if RANK == 0:
+            print(f"Training until {budget.target} supervised sequence-steps (train_supervised_target); epochs={config.epochs} is ignored")
+        iter_ids = itertools.count()
+    else:
+        iter_ids = range(total_iters)
+    for _iter_id in iter_ids:
         print (f"[Rank {RANK}, World Size {WORLD_SIZE}]: Epoch {_iter_id * train_epochs_per_iter}")
 
         ############ Train Iter
@@ -802,9 +848,16 @@ def launch(hydra_config: DictConfig):
 
             if RANK == 0 and metrics is not None:
                 wandb.log(metrics, step=train_state.step)
-                progress_bar.update(train_state.step - progress_bar.n)  # type: ignore
+                progress_bar.update((budget.count if budget is not None else train_state.step) - progress_bar.n)  # type: ignore
             if config.ema:
                 ema_helper.update(train_state.model)
+            if budget is not None and budget.reached:
+                break
+        is_last_iter = budget.reached if budget is not None else (_iter_id == total_iters - 1)
+        if RANK == 0 and budget is not None:
+            expected = budget.expected_total_steps()
+            print(f"Supervised sequence-steps: {budget.count} / {budget.target} at step {train_state.step}"
+                  + (f", expected total steps {expected:.0f}" if expected is not None else ""))
 
         if _iter_id >= config.min_eval_interval:
             ############ Evaluation
@@ -832,11 +885,14 @@ def launch(hydra_config: DictConfig):
             ############ Checkpointing
             if RANK == 0:
                 print("SAVE CHECKPOINT")
-            if RANK == 0 and (config.checkpoint_every_eval or (_iter_id == total_iters - 1)):
+            if RANK == 0 and (config.checkpoint_every_eval or is_last_iter):
                 save_train_state(config, train_state_eval)
 
             if config.ema:
                 del train_state_eval
+
+        if budget is not None and budget.reached:
+            break
 
     # finalize
     if dist.is_initialized():

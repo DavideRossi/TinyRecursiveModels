@@ -11,6 +11,7 @@ from models.common import trunc_normal_init_
 from models.layers import rms_norm, LinearSwish, SwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear
 from models.sparse_embedding import CastedSparseEmbedding
 from models.aux_halt_heads import AuxHaltHeadConfig, AuxHaltInputs, build_aux_halt_heads
+from models.losses import compute_correctness
 
 IGNORE_LABEL_ID = -100
 
@@ -81,6 +82,9 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     halt_warmup_prob: float = 0.0
     halt_warmup_min: int = 1
     halt_warmup_max: Optional[int] = None
+    # Release: a sequence whose prediction is fully correct at its last warm-up step halts there,
+    # with no supervised step (no loss, not counted in the training metrics). Needs halt_warmup_prob > 0.
+    halt_warmup_release: bool = False
 
 class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
     def __init__(self, config: TinyRecursiveReasoningModel_ACTV1Config) -> None:
@@ -267,6 +271,8 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
         self.config = TinyRecursiveReasoningModel_ACTV1Config(**config_dict)
         if not 0.0 <= self.config.halt_warmup_prob <= 1.0:
             raise ValueError(f"halt_warmup_prob must be in [0, 1], got {self.config.halt_warmup_prob}")
+        if self.config.halt_warmup_release and self.config.halt_warmup_prob == 0:
+            raise ValueError("halt_warmup_release needs halt_warmup_prob > 0")
         if self.config.halt_warmup_prob > 0:
             if not 1 <= self.config.halt_warmup_min <= self.warmup_max:
                 raise ValueError(f"warm-up range must satisfy 1 <= halt_warmup_min <= halt_warmup_max, "
@@ -371,5 +377,10 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
                     # Similar concept as PQN https://arxiv.org/abs/2407.04811
                     _, _, (next_q_halt_logits, next_q_continue_logits), _ = self.inner(new_inner_carry, new_current_data)
                     outputs["target_q_continue"] = torch.sigmoid(torch.where(is_last_step, next_q_halt_logits, torch.maximum(next_q_halt_logits, next_q_continue_logits)))
+
+            # Release: solved at the last warm-up step -> halt there, without a supervised step
+            if self.warmup_enabled and self.config.halt_warmup_release:
+                _, loss_counts, _, seq_is_correct = compute_correctness(torch.argmax(logits, dim=-1), new_current_data["labels"])
+                halted = halted | ((warmup > 0) & (window_steps == 0) & (loss_counts > 0) & seq_is_correct)
 
         return TinyRecursiveReasoningModel_ACTV1Carry(new_inner_carry, new_steps, halted, new_current_data, warmup), outputs

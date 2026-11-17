@@ -281,7 +281,10 @@ share. Other training metrics with the option on:
 | `train/supervised_share` | supervised sequence-steps / sequences in the batch |
 | `train/supervised_depth_mean`, `_max` | step counted from the sequence's start, over supervised steps |
 | `train/warmup_solved_share` | of the sequences at their last warm-up step, the share already solved |
+| `train/warmup_released_share` | of the sequences at their last warm-up step, the share released (with `halt_warmup_release`) |
 | `train/steps`, `train/steps_total` | steps of halted sequences: window steps / from the start (always logged) |
+| `train/supervised_cumulative` | supervised sequence-steps since the start (always logged) |
+| `train/target_progress` | `supervised_cumulative` / `train_supervised_target` (with a target) |
 
 Example: the 4-step run of this branch with warm-up (p = 0.2, s in 1–12):
 
@@ -290,6 +293,36 @@ SIF=/scratch.hpc/$USER/trm-modern.sif RUN_NAME=sudoku_aux_linear_hms4_warmup \
   sbatch slurm/train_sudoku.sbatch \
   'arch.aux_halt_heads=[{type:detached_linear}]' eval_capture_steps=True \
   arch.halt_max_steps=4 arch.halt_warmup_prob=0.2 arch.halt_warmup_min=1 arch.halt_warmup_max=12
+```
+
+**Release** (`arch.halt_warmup_release=True`, default off): a sequence whose
+prediction is fully correct at its last warm-up step halts there, without a
+supervised step. It gets no loss, isn't counted in any training metric except
+`warmup_released_share` and `warmup_solved_share`, and its slot loads a new
+puzzle at the next step.
+
+**Training until a number of supervised sequence-steps**
+(`train_supervised_target=N`, default off): training stops at the first step
+whose cumulative count reaches N, instead of after `epochs`. The data keeps
+cycling in iterations of `eval_interval` epochs. Evaluation and checkpoints run
+every `eval_interval` as usual and once more at the stopping step, whose number
+is not a multiple of the iteration length. The cosine of the learning-rate
+schedule runs on supervised sequence-steps (see
+[utils/supervised_budget.py](../utils/supervised_budget.py)), so it ends exactly
+at the stopping step. With `lr_min_ratio=1.0`, as in these runs, the rate is
+constant after the warm-up anyway. The progress bar counts supervised
+sequence-steps; the log prints the count and the expected total number of steps
+at the end of each iteration.
+
+The 4-step run without warm-up had 65,100 steps × 768 = **49,996,800**
+supervised sequence-steps. Same budget, with warm-up and release:
+
+```bash
+SIF=/scratch.hpc/$USER/trm-modern.sif RUN_NAME=sudoku_aux_linear_hms4_warmup_release \
+  sbatch slurm/train_sudoku.sbatch \
+  'arch.aux_halt_heads=[{type:detached_linear}]' eval_capture_steps=True \
+  arch.halt_max_steps=4 arch.halt_warmup_prob=0.2 arch.halt_warmup_min=1 arch.halt_warmup_max=12 \
+  arch.halt_warmup_release=True train_supervised_target=49996800
 ```
 
 ## 8. Evaluate an existing checkpoint
