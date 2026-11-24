@@ -1,0 +1,37 @@
+{
+ "seed": 1,
+ "base": {
+  "targets_mode": "fixed",
+  "num_targets": 8,
+  "edge_order": "random",
+  "targets_position": "after",
+  "answer_format": "direct",
+  "pool_size": 2048
+ },
+ "grid": {
+  "depths": [1, 2, 4, 8, 12, 16, 24, 32],
+  "branchings": [1, 2, 4, 8],
+  "num_samples": 1000,
+  "total_edges": 512
+ },
+ "companions": {
+  "num_samples": 200,
+  "cells": "trimmed"
+ },
+ "diag": {
+  "depth": 8,
+  "branchings": [1, 2, 4, 8],
+  "num_targets": [6, 9, 12],
+  "num_samples": 1000,
+  "total_edges": 512
+ },
+ "mixed": [
+  {"name": "q4_in_distribution", "num_samples": 2000,
+   "overrides": {"depth": {"range": [1, 8]}, "branching": {"range": [1, 4]}, "num_queries": 4,
+                 "total_edges": 256}},
+  {"name": "q4_deep", "num_samples": 2000,
+   "overrides": {"depth": {"range": [9, 16]}, "branching": {"range": [1, 4]}, "num_queries": 4,
+                 "total_edges": 512}}
+ ],
+ "readable_samples": 5
+}
