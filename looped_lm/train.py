@@ -268,6 +268,7 @@ def train(cfg: TrainConfig, model_cfg: ModelConfig, task: Optional[TaskConfig] =
                 waits.append(t1 - t0)
                 continue
             stats = dict(stats, grad_norm=grad_norm.detach().float(), steps=torch.tensor(1, device=device),
+                         clipped=(grad_norm.detach() > cfg.grad_clip).float(),
                          real_tokens=batch["length"].sum().to(device) if "length" in batch else torch.tensor(0),
                          padded_tokens=torch.tensor(batch["tokens"].numel(), device=device))
             acc = stats if acc is None else {k: acc[k] + stats[k] for k in acc}
@@ -278,7 +279,8 @@ def train(cfg: TrainConfig, model_cfg: ModelConfig, task: Optional[TaskConfig] =
                             "train/final_loss": a["final_loss_sum"] / max(1, a["final_n"]),
                             "train/final_accuracy": a["final_correct"] / max(1, a["final_n"]),
                             "train/end_accuracy": a["end_correct"] / max(1, a["end_n"]),
-                            "train/grad_norm": a["grad_norm"] / a["steps"], "train/lr": lr_at(step - 1, cfg),
+                            "train/grad_norm": a["grad_norm"] / a["steps"], "train/clip_fraction": a["clipped"] / a["steps"],
+                            "train/lr": lr_at(step - 1, cfg),
                             "train/tokens_per_s": a["real_tokens"] / dt, "train/padded_tokens_per_s": a["padded_tokens"] / dt,
                             "train/step_time": dt / a["steps"], "train/data_wait": data_wait / a["steps"]}, step=step)
                 acc, t_last, data_wait = None, time.time(), 0.0

@@ -13,6 +13,7 @@ EDGE_ORDERS = ("random", "reverse", "forward")
 TARGET_POSITIONS = ("after", "before")
 ANSWER_FORMATS = ("direct", "path", "frontier", "dfs", "copy")
 TARGETS_MODES = ("per_component", "fixed")
+SYNTAXES = ("arrow", "pair")
 
 
 class Dist:
@@ -110,6 +111,11 @@ class TaskConfig:
     targets_position: after | before the edges
     answer_format: direct | path | frontier | dfs | copy (a pipeline check: the answer is the
                    queried name itself, the token right after "Q:")
+    syntax: how edges and query prompts are written. arrow (default): edges "x > t", prompts
+            "Q: x ?", the answer after "?". pair: edges "x t ;", prompts "Q: x", the answer right
+            after x, so that one lookup is the classic two-part induction circuit (the answer's
+            position has x as its predecessor, like the destination of the edge "x t"). pair
+            needs targets_position "after" (a target list before pairs would be ambiguous).
     pool_size: node names are drawn from the first pool_size names of the vocabulary
     """
     name: str = "default"
@@ -126,6 +132,7 @@ class TaskConfig:
     edge_order: str = "random"
     targets_position: str = "after"
     answer_format: str = "direct"
+    syntax: str = "arrow"
     pool_size: int = NODE_POOL
 
     def __post_init__(self):
@@ -218,6 +225,11 @@ class TaskConfig:
             raise ValueError(f"targets_position must be one of {TARGET_POSITIONS}, got {self.targets_position!r}")
         if self.answer_format not in ANSWER_FORMATS:
             raise ValueError(f"answer_format must be one of {ANSWER_FORMATS}, got {self.answer_format!r}")
+        if self.syntax not in SYNTAXES:
+            raise ValueError(f"syntax must be one of {SYNTAXES}, got {self.syntax!r}")
+        if self.syntax == "pair" and self.targets_position != "after":
+            raise ValueError("syntax 'pair' needs targets_position 'after': a target list followed by "
+                             "pairs 'x t ;' has no boundary")
         if self.targets_mode not in TARGETS_MODES:
             raise ValueError(f"targets_mode must be one of {TARGETS_MODES}, got {self.targets_mode!r}")
         for name in ("depth", "branching", "num_queries"):

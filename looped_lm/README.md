@@ -129,7 +129,8 @@ current step and stops; the Slurm script forwards Slurm's time-limit signal.
 
 **Logged every `log_interval` = 50 steps** (averages over the interval): `train/loss`,
 `train/final_loss` (final answers only), `train/final_accuracy` (role 1, argmax),
-`train/end_accuracy` (role 5), `train/grad_norm` (before clipping), `train/lr`,
+`train/end_accuracy` (role 5), `train/grad_norm` (before clipping), `train/clip_fraction`
+(share of the interval's steps whose norm exceeded `grad_clip`, i.e. were clipped), `train/lr`,
 `train/tokens_per_s` (real tokens; `padded_tokens_per_s` with padding), `train/step_time`,
 `train/data_wait` (time per step spent waiting for the DataLoader; if it approaches the step
 time, add workers).

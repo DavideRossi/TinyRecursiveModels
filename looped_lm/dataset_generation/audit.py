@@ -61,7 +61,7 @@ def heuristic_guesses(tokens, depths: List[int], rng: np.random.Generator) -> Di
     last = {t: -1 for t in targets}
     for k, (u, v) in enumerate(p.edges):
         if v in last:
-            last[v] = max(last[v], p.edge_token_pos[k] + 2)
+            last[v] = max(last[v], p.edge_dest_pos[k])
     for k, t in enumerate(targets):
         last[t] = max(last[t], p.targets_pos + 1 + k)
     # Length of each target's path and its root, walking back to its source (backward, not from the query)

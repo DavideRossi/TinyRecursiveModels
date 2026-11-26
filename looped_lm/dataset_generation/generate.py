@@ -288,14 +288,15 @@ def make_sample(config: TaskConfig, seed: int, index: int, split: str = "train",
     target_block = [TARGETS] + targets
     if config.targets_position == "before":
         emit(target_block)
+    pair = config.syntax == "pair"
     for s, t in edges:
-        emit([s, ARROW, t])
+        emit([s, t, SEP] if pair else [s, ARROW, t])
     if config.targets_position == "after":
         emit(target_block)
     queries = []
     for qi, c in enumerate(queried):
         prompt_pos = len(toks)
-        emit([QUERY, c.source, ASK], q=qi, d=c.depth, b=c.branching)
+        emit([QUERY, c.source] if pair else [QUERY, c.source, ASK], q=qi, d=c.depth, b=c.branching)
         ids, rls = answer_tokens(config.answer_format, c.branches, c.target_branch, c.source)
         answer_start = len(toks)
         emit(ids, q=qi, d=c.depth, b=c.branching, m=True, role_list=rls)

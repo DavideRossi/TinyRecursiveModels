@@ -21,7 +21,7 @@ from looped_lm.dataset_generation.config import ANSWER_FORMATS, EDGE_ORDERS, TAR
 from looped_lm.dataset_generation.dataset import GeneratedDataset, StoredDataset, TrainStream, collate  # noqa: E402
 from looped_lm.dataset_generation.generate import batch_edges, make_batch, make_sample  # noqa: E402
 from looped_lm.dataset_generation.storage import StoredSet, write_set  # noqa: E402
-from looped_lm.dataset_generation.vocab import ARROW, BACKTRACK, CLOSE, OPEN, VOCAB  # noqa: E402
+from looped_lm.dataset_generation.vocab import ARROW, ASK, BACKTRACK, CLOSE, OPEN, QUERY, SEP, VOCAB  # noqa: E402
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_checker import N, seq  # noqa: E402
 
@@ -570,6 +570,60 @@ def test_copy_format():
     c = make_sample(cfg, 0, 3)
     differ = np.nonzero(d.tokens != c.tokens)[0]
     assert len(differ) and all(c.role[k] == formats.ROLE_FINAL for k in differ)
+
+
+def test_pair_syntax():
+    """Pair syntax ("x t ;", "Q: x"): valid in every format and order; the same graph, targets and
+    queries as arrow syntax; the answer predicted from the queried name, whose edge destination has
+    it as predecessor; arrow samples unchanged; misuse rejected."""
+    for fmt, order in itertools.product(ANSWER_FORMATS, EDGE_ORDERS):
+        for base in (FIXED, MIXED):
+            arrow_cfg = TaskConfig(**base, answer_format=fmt, edge_order=order)
+            pair_cfg = arrow_cfg.replace(syntax="pair")
+            for i in range(6):
+                a, p = make_sample(arrow_cfg, 1, i), make_sample(pair_cfg, 1, i)
+                check_sample(p, fmt, order, "after", num_edges=p.num_edges, syntax="pair")
+                try:
+                    check_sample(p, fmt, syntax="arrow")
+                except CheckError:
+                    pass
+                else:
+                    raise AssertionError("a pair sample must fail as arrow")
+                pa, pp = parse(a.tokens), parse(p.tokens)
+                assert pa.syntax == "arrow" and pp.syntax == "pair"
+                assert pa.edges == pp.edges and pa.targets == pp.targets
+                assert [q["answer"] for q in pa.queries] == [q["answer"] for q in pp.queries]
+                assert len(p.tokens) == len(a.tokens) - len(p.queries) and ARROW not in p.tokens and ASK not in p.tokens
+                for (u, v), k, dpos in zip(pp.edges, pp.edge_token_pos, pp.edge_dest_pos):
+                    assert dpos == k + 1 and p.tokens[k + 2] == SEP
+                for q in p.queries:
+                    assert p.tokens[q["prompt_pos"]] == QUERY and q["answer_start"] == q["prompt_pos"] + 2
+                    if fmt == "direct":  # the predicting position holds the source
+                        assert p.pred_pos[q["answer_start"]] == q["prompt_pos"] + 1
+                        assert p.tokens[p.pred_pos[q["answer_start"]]] == q["source"]
+    # The default is arrow, and an explicit "arrow" gives the same samples
+    cfg = TaskConfig(**FIXED)
+    assert cfg.syntax == "arrow" and TaskConfig.from_dict({k: v for k, v in cfg.to_dict().items() if k != "syntax"}).syntax == "arrow"
+    assert all(np.array_equal(make_sample(cfg, 0, i).tokens, make_sample(cfg.replace(syntax="arrow"), 0, i).tokens)
+               for i in range(5))
+    # Misuse: pair with the target list before the edges, unknown syntax, mixed edges
+    for bad in (dict(syntax="pair", targets_position="before"), dict(syntax="slash")):
+        try:
+            TaskConfig(**FIXED, **bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"{bad} must be rejected")
+    p = make_sample(TaskConfig(**FIXED, syntax="pair"), 0, 0)
+    k = parse(p.tokens).edge_token_pos[1]
+    mixed = p.tokens.copy()
+    mixed[k + 1], mixed[k + 2] = ARROW, p.tokens[k + 1]  # second edge rewritten as "u > v"
+    try:
+        parse(mixed)
+    except CheckError as e:
+        assert "syntax" in str(e)
+    else:
+        raise AssertionError("mixed syntaxes must be rejected")
 
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

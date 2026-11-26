@@ -196,7 +196,7 @@ def _check_dir(root: str, limit=None) -> int:
             rec = st.get(i)
             try:
                 check_sample(rec, cfg.answer_format, cfg.edge_order, cfg.targets_position,
-                             num_edges=rec["num_edges"], num_targets=rec["num_targets"])
+                             num_edges=rec["num_edges"], num_targets=rec["num_targets"], syntax=cfg.syntax)
                 if cfg.fixed and rec["num_targets"] not in cfg.num_targets.support:
                     raise CheckError(f"{rec['num_targets']} targets, outside num_targets {cfg.num_targets.spec}")
             except CheckError as e:

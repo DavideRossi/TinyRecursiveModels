@@ -251,13 +251,13 @@ Vocabulary (`vocab.json`, the same for every set): 11 special tokens, then the n
 | 0 | `<pad>` | padding (collate) |
 | 1 | `<bos>` | start of sample |
 | 2 | `<eos>` | after the last answer |
-| 3 | `>` | edge: `src > dst` |
+| 3 | `>` | edge: `src > dst` (arrow syntax) |
 | 4 | `T:` | starts the target list |
 | 5 | `Q:` | starts a query |
-| 6 | `?` | ends the query prompt; the answer follows |
+| 6 | `?` | ends the query prompt; the answer follows (arrow syntax) |
 | 7, 8 | `[`, `]` | frontier levels |
 | 9 | `<bt>` | backtrack marker (dfs) |
-| 10 | `;` | query separator: after every answer except the last |
+| 10 | `;` | query separator: after every answer except the last; in pair syntax also ends each edge |
 | 11 … 2058 | `n0` … `n2047` | node names |
 
 Layout with `targets_position="after"` (the default):
@@ -268,6 +268,24 @@ Layout with `targets_position="after"` (the default):
 
 With `targets_position="before"`, the `T: …` block comes right after `<bos>`.
 
+**Pair syntax** (`syntax="pair"`; the default is `"arrow"`, above): edges are written `s d ;` and
+query prompts `Q: x`, with the answer right after the queried name:
+
+```
+<bos> s1 d1 ; s2 d2 ; ... T: t1 t2 ... Q: x <answer> ; Q: y <answer> ; ... Q: z <answer> <eos>
+```
+
+Why: in arrow syntax one lookup (edge `x > t`, prompt `Q: x ?`) needs a three-part circuit: the
+key at t must encode the token two positions back, and the predicting position (`?`) must first
+fetch x from its predecessor before matching. In pair syntax the answer's predicting position
+is x itself, and the destination of the edge `x t` has x as its predecessor: the classic
+two-part induction circuit (`… A B … A` → B). With deeper graphs a node that is both a
+destination and a source appears before `;` in one edge and before its successor in another;
+telling the two apart is part of the chase. Pair syntax needs `targets_position="after"`
+(a target list followed by pairs would have no boundary). Same samples otherwise: the same
+graph, edge order, targets and queries as arrow syntax, and the same number of tokens per edge;
+each prompt is one token shorter.
+
 ## 7. Answer formats
 
 Throughout, `b_1 … b_b` are the source's branches in canonical order, and `b_k[l]` is the node
@@ -276,6 +294,7 @@ at level l of branch k (level 1 = first node after the source; level d = the end
 | format | answer | length |
 |---|---|---|
 | `direct` | `t` | 1 |
+| `copy` | `x`, the queried name itself (a pipeline check, not a task) | 1 |
 | `path` | the target branch's nodes, levels 1 … d (the last is `t`) | d |
 | `frontier` | for each level l = 1 … d: `[ b_1[l] … b_b[l] ]`; then `t` | d·(b + 2) + 1 |
 | `dfs` | branches in canonical order. A dead-end branch is written out in full (levels 1 … d), then `<bt>`. The target branch is written out (its last node is `t`), and the answer stops there. | k·(d + 1) + d, where k = dead-end branches before the target branch |
@@ -337,7 +356,8 @@ compare the argmax at `pred_pos[t]` with `tokens[t]` wherever `role == 1`.
 | `trim_edges` | `null` | | `fixed` only: the budget the distractors are trimmed to, if smaller than the edge count; the rest is padding. Used by the companion sets B (§12) |
 | `edge_order` | `"random"` | | `random`, `reverse` or `forward` (§3) |
 | `targets_position` | `"after"` | | `after` or `before` the edges |
-| `answer_format` | `"direct"` | | `direct`, `path`, `frontier` or `dfs` (§7) |
+| `answer_format` | `"direct"` | | `direct`, `path`, `frontier`, `dfs` or `copy` (§7) |
+| `syntax` | `"arrow"` | | `arrow` (`s > d`, `Q: x ?`) or `pair` (`s d ;`, `Q: x`; needs `targets_position="after"`) (§6) |
 | `pool_size` | 2048 | | names are drawn from `n0 … n{pool_size−1}` |
 
 **Distributions** (`Dist`), for every field marked "sampled":
@@ -604,7 +624,8 @@ The checker validates a sample from its **token ids alone**. It imports only the
 never the generator or `formats.py`, so a generator bug can't hide itself. It:
 
 1. **Parses** `<bos>`, the edges, the target list (before or after the edges), and the queries
-   with their answers and end tokens. Anything else is an error, e.g. tokens after `<eos>` other
+   with their answers and end tokens. The syntax (arrow or pair) is read from the first edge,
+   and every edge and prompt must follow it. Anything else is an error, e.g. tokens after `<eos>` other
    than padding, or a last query not ended by `<eos>`.
 2. **Checks the graph structure:**
    - no self-loops and no duplicate edges;

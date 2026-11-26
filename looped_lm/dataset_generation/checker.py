@@ -24,6 +24,8 @@ class Parsed:
     def __init__(self):
         self.edges: List[Tuple[int, int]] = []
         self.edge_token_pos: List[int] = []  # position of each edge's source token
+        self.edge_dest_pos: List[int] = []  # position of each edge's destination token
+        self.syntax: Optional[str] = None  # arrow ("x > t", "Q: x ?") | pair ("x t ;", "Q: x"), from the edges
         self.targets: List[int] = []
         self.targets_pos: Optional[int] = None  # position of T:
         self.targets_position: Optional[str] = None  # before | after the edges
@@ -51,10 +53,20 @@ def parse(tokens: Sequence[int], vocab: Vocab = VOCAB) -> Parsed:
         elif vocab.is_node(toks[i]):
             if p.targets_position == "after":
                 raise CheckError(f"edge at position {i} after the target list")
-            if i + 2 >= n or toks[i + 1] != ARROW or not vocab.is_node(toks[i + 2]):
+            if i + 2 >= n:
                 raise CheckError(f"malformed edge at position {i}")
-            p.edges.append((toks[i], toks[i + 2]))
+            if toks[i + 1] == ARROW and vocab.is_node(toks[i + 2]):
+                syntax, dest = "arrow", i + 2
+            elif vocab.is_node(toks[i + 1]) and toks[i + 2] == SEP:
+                syntax, dest = "pair", i + 1
+            else:
+                raise CheckError(f"malformed edge at position {i}")
+            if p.syntax is not None and syntax != p.syntax:
+                raise CheckError(f"edge at position {i} in {syntax} syntax after {p.syntax} edges")
+            p.syntax = syntax
+            p.edges.append((toks[i], toks[dest]))
             p.edge_token_pos.append(i)
+            p.edge_dest_pos.append(dest)
             i += 3
         else:
             raise CheckError(f"unexpected token {vocab.tokens[toks[i]]!r} at position {i}")
@@ -66,10 +78,11 @@ def parse(tokens: Sequence[int], vocab: Vocab = VOCAB) -> Parsed:
     while i < n:
         if toks[i] != QUERY:
             raise CheckError(f"expected Q: at position {i}")
-        if i + 2 >= n or not vocab.is_node(toks[i + 1]) or toks[i + 2] != ASK:
+        prompt_len = 2 if p.syntax == "pair" else 3
+        if i + prompt_len >= n or not vocab.is_node(toks[i + 1]) or (prompt_len == 3 and toks[i + 2] != ASK):
             raise CheckError(f"malformed query prompt at position {i}")
-        q = {"prompt_pos": i, "source": toks[i + 1], "answer_start": i + 3}
-        i += 3
+        q = {"prompt_pos": i, "source": toks[i + 1], "answer_start": i + prompt_len}
+        i += prompt_len
         while i < n and (vocab.is_node(toks[i]) or toks[i] in answer_tokens):
             i += 1
         if i >= n or toks[i] not in (SEP, EOS):
@@ -284,18 +297,22 @@ def check_edge_order(p: Parsed, g: Graph, edge_order: str) -> None:
 
 
 def check_sample(sample, fmt: str, edge_order: Optional[str] = None, targets_position: Optional[str] = None,
-                 num_edges: Optional[int] = None, num_targets: Optional[int] = None, vocab: Vocab = VOCAB) -> dict:
+                 num_edges: Optional[int] = None, num_targets: Optional[int] = None, vocab: Vocab = VOCAB,
+                 syntax: Optional[str] = None) -> dict:
     """Full check of a sample (generate.Sample, or a dict with the same fields as arrays).
 
     Checks the graph and the answers from the tokens, then the metadata against them. Raises
     CheckError with the first problem found; returns the analysis otherwise. num_targets: the
-    exact number of targets required (fixed mode)."""
+    exact number of targets required (fixed mode); syntax: the edge and prompt syntax required
+    (arrow | pair; the parser reads it from the edges)."""
     get = (lambda k: sample[k]) if isinstance(sample, dict) else (lambda k: getattr(sample, k))
     tokens = np.asarray(get("tokens"))
     a = analyze(tokens, fmt, vocab, num_targets=num_targets)
     p, g = a["parsed"], a["graph"]
     if edge_order is not None:
         check_edge_order(p, g, edge_order)
+    if syntax is not None and p.syntax != syntax:
+        raise CheckError(f"{p.syntax} syntax, expected {syntax}")
     if targets_position is not None and p.targets_position != targets_position:
         raise CheckError(f"target list {p.targets_position} the edges, expected {targets_position}")
     if num_edges is not None and len(p.edges) != num_edges:
