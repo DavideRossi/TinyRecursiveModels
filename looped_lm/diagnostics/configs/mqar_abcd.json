@@ -1,0 +1,10 @@
+{
+ "kind": "mqar",
+ "name": "mqar_abcd",
+ "num_pairs": 16,
+ "seq_len": 160,
+ "shared_vocab": true,
+ "arrow": true,
+ "query_markers": true,
+ "target_list": true
+}

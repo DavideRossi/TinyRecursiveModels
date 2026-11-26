@@ -48,7 +48,9 @@ def loss_positions(loss_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]
 
 def loss_and_stats(model, batch: dict) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Mean cross-entropy over the loss tokens of the batch, and device-side counts for logging:
-    final answers (role 1) and end tokens (role 5), each with the number correct (argmax)."""
+    final answers (role 1), the final answers of each sample's first query (query_index 0: no
+    earlier answer in the context, so no elimination), and end tokens (role 5), each with the
+    number correct (argmax)."""
     tokens = batch["tokens"]
     hidden = model(tokens)
     b, t = loss_positions(batch["loss_mask"])
@@ -58,8 +60,10 @@ def loss_and_stats(model, batch: dict) -> Tuple[torch.Tensor, Dict[str, torch.Te
     correct = logits.argmax(-1) == target
     role = batch["role"][b, t]
     final, end = role == ROLE_FINAL, role == ROLE_END
+    first = final & (batch["query_index"][b, t] == 0)
     stats = {"loss_sum": ce.detach().sum(), "loss_tokens": torch.tensor(len(ce), device=ce.device),
              "final_n": final.sum(), "final_correct": (correct & final).sum(),
              "final_loss_sum": (ce.detach() * final).sum(),
+             "first_n": first.sum(), "first_correct": (correct & first).sum(),
              "end_n": end.sum(), "end_correct": (correct & end).sum()}
     return ce.mean(), stats

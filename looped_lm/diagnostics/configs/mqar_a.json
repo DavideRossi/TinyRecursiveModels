@@ -1,0 +1,10 @@
+{
+ "kind": "mqar",
+ "name": "mqar_a",
+ "num_pairs": 16,
+ "seq_len": 160,
+ "shared_vocab": true,
+ "arrow": false,
+ "query_markers": false,
+ "target_list": false
+}

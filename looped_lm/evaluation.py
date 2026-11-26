@@ -30,7 +30,7 @@ def wilson(k: int, n: int, z: float = 1.959964) -> tuple:
 
 def score_batch(model, batch: dict) -> Dict[str, np.ndarray]:
     """Per final answer: correct (argmax at pred_pos == answer token), its cross-entropy, the query's
-    d and b, and the sample's row in the batch."""
+    d and b, its index among the sample's queries, and the sample's row in the batch."""
     tokens = batch["tokens"]
     hidden = model(tokens)
     b, t = (batch["role"] == ROLE_FINAL).nonzero(as_tuple=True)
@@ -40,7 +40,7 @@ def score_batch(model, batch: dict) -> Dict[str, np.ndarray]:
     return {"correct": (logits.argmax(-1) == target).cpu().numpy(),
             "loss": F.cross_entropy(logits, target, reduction="none").cpu().numpy(),
             "depth": batch["depth"][b, t].cpu().numpy(), "branching": batch["branching"][b, t].cpu().numpy(),
-            "row": b.cpu().numpy()}
+            "query_index": batch["query_index"][b, t].cpu().numpy(), "row": b.cpu().numpy()}
 
 
 def length_batches(lengths: List[int], max_tokens: int, max_batch: int = 256) -> List[List[int]]:
@@ -75,16 +75,18 @@ def load_set(path: str, num: Optional[int] = None, max_tokens: int = 131072) -> 
 @torch.no_grad()
 def evaluate_set(model, loaded: dict, device, amp: bool = True, by_db: Optional[bool] = None) -> dict:
     """Accuracy of final answers with a 95% interval, number of answers, chance (mean 1 / #targets),
-    mean loss on final answers; for sets with several queries per sample, also by the query's (d, b)."""
+    mean loss on final answers; the same for each sample's first query only (first_query_*: no
+    earlier answer in the context, so the elimination heuristic can't help); for sets with several
+    queries per sample, also by the query's (d, b)."""
     was_training = model.training
     model.eval()
-    cols = {k: [] for k in ("correct", "loss", "depth", "branching", "chance")}
+    cols = {k: [] for k in ("correct", "loss", "depth", "branching", "query_index", "chance")}
     for batch in loaded["batches"]:
         dev = to_device(batch, device)
         with torch.autocast(device_type=torch.device(device).type, dtype=torch.bfloat16,
                             enabled=amp and torch.device(device).type == "cuda"):
             s = score_batch(model, dev)
-        for k in ("correct", "loss", "depth", "branching"):
+        for k in ("correct", "loss", "depth", "branching", "query_index"):
             cols[k].append(s[k])
         cols["chance"].append(1.0 / batch["num_targets"].numpy()[s["row"]])
     model.train(was_training)
@@ -97,6 +99,7 @@ def evaluate_set(model, loaded: dict, device, amp: bool = True, by_db: Optional[
                 "chance": float(c["chance"][m].mean()) if n else float("nan"),
                 "loss": float(c["loss"][m].mean()) if n else float("nan")}
     out = summary(np.ones(len(c["correct"]), dtype=bool))
+    out.update({f"first_query_{k}": v for k, v in summary(c["query_index"] == 0).items()})
     out["num_samples"] = loaded["num_samples"]
     out["tokens_mean"] = loaded["tokens_mean"]
     if by_db is None:

@@ -26,6 +26,7 @@ from torch.utils.data import DataLoader
 
 from .dataset_generation.config import TaskConfig
 from .dataset_generation.dataset import TrainStream
+from .diagnostics.mqar import MqarConfig, MqarStream, is_mqar
 from .evaluation import evaluate_set, load_set
 from .model import LoopedLM, ModelConfig
 from .objective import loss_and_stats, pad_to_multiple, to_device
@@ -94,8 +95,15 @@ def param_groups(model: LoopedLM, weight_decay: float):
     return [{"params": decay, "weight_decay": weight_decay}, {"params": no_decay, "weight_decay": 0.0}]
 
 
-def load_task(cfg: TrainConfig) -> TaskConfig:
-    task = TaskConfig.load(cfg.data_config)
+def load_task(cfg: TrainConfig):
+    """The data config: a TaskConfig, or an MqarConfig (diagnostics; its JSON has "kind": "mqar")."""
+    with open(cfg.data_config) as f:
+        d = json.load(f)
+    if is_mqar(d):
+        if cfg.answer_format:
+            raise ValueError("--answer_format does not apply to an MQAR config")
+        return MqarConfig.from_dict(d)
+    task = TaskConfig.from_dict(d)
     return task.replace(answer_format=cfg.answer_format) if cfg.answer_format else task
 
 
@@ -207,8 +215,12 @@ def train(cfg: TrainConfig, model_cfg: ModelConfig, task: Optional[TaskConfig] =
             _save(os.path.join(cfg.run_dir, f"model_step_{step}.pt"),
                   {k: payload[k] for k in ("model", "step", "model_config", "train_config", "task_config")})
 
-    stream = TrainStream(task, seed=cfg.stream_seed, batch_size=cfg.batch_size, start=step,
-                         allow_small_pool=cfg.allow_small_pool)
+    mqar = isinstance(task, MqarConfig)
+    if mqar:
+        stream = MqarStream(task, seed=cfg.stream_seed, batch_size=cfg.batch_size, start=step)
+    else:
+        stream = TrainStream(task, seed=cfg.stream_seed, batch_size=cfg.batch_size, start=step,
+                             allow_small_pool=cfg.allow_small_pool)
     loader = DataLoader(stream, batch_size=None, num_workers=cfg.num_workers, pin_memory=device.type == "cuda",
                         prefetch_factor=4 if cfg.num_workers > 0 else None,
                         persistent_workers=False)
@@ -216,7 +228,7 @@ def train(cfg: TrainConfig, model_cfg: ModelConfig, task: Optional[TaskConfig] =
     pad_multiple = cfg.pad_multiple or (128 if cfg.compile else 1)
 
     eval_data = {}
-    if cfg.eval_interval > 0 and not bench:
+    if cfg.eval_interval > 0 and not bench and not mqar:  # MQAR: the stream itself is held out (no sample repeats)
         for name in [s for s in cfg.eval_sets.split(",") if s]:
             path = os.path.join(cfg.eval_suite, name)
             if not os.path.exists(os.path.join(path, "meta.json")):
@@ -236,7 +248,9 @@ def train(cfg: TrainConfig, model_cfg: ModelConfig, task: Optional[TaskConfig] =
         for name, data in eval_data.items():
             r = evaluate_set(model, data, device)
             out.update({f"eval/{name}/accuracy": r["accuracy"], f"eval/{name}/loss": r["loss"],
-                        f"eval/{name}/chance": r["chance"], f"eval/{name}/n": r["n"]})
+                        f"eval/{name}/chance": r["chance"], f"eval/{name}/n": r["n"],
+                        f"eval/{name}/first_query_accuracy": r["first_query_accuracy"],
+                        f"eval/{name}/first_query_chance": r["first_query_chance"]})
         out.update({f"model/{k}": v for k, v in model.embed_norms().items()})
         return out
 
@@ -280,13 +294,14 @@ def train(cfg: TrainConfig, model_cfg: ModelConfig, task: Optional[TaskConfig] =
                 logger.log({"train/loss": a["loss_sum"] / max(1, a["loss_tokens"]),
                             "train/final_loss": a["final_loss_sum"] / max(1, a["final_n"]),
                             "train/final_accuracy": a["final_correct"] / max(1, a["final_n"]),
+                            "train/first_query_accuracy": a["first_correct"] / max(1, a["first_n"]),
                             "train/end_accuracy": a["end_correct"] / max(1, a["end_n"]),
                             "train/grad_norm": a["grad_norm"] / a["steps"], "train/clip_fraction": a["clipped"] / a["steps"],
                             "train/lr": lr_at(step - 1, cfg),
                             "train/tokens_per_s": a["real_tokens"] / dt, "train/padded_tokens_per_s": a["padded_tokens"] / dt,
                             "train/step_time": dt / a["steps"], "train/data_wait": data_wait / a["steps"]}, step=step)
                 acc, t_last, data_wait = None, time.time(), 0.0
-            if eval_data and (step % cfg.eval_interval == 0 or step == cfg.steps):
+            if cfg.eval_interval > 0 and (step % cfg.eval_interval == 0 or step == cfg.steps):  # norms even without sets
                 logger.log(run_eval(), step=step)
                 t_last = time.time()
             done = step == cfg.steps or stop.requested or (stop_after is not None and step >= stop_after)

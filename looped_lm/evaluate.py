@@ -6,7 +6,8 @@
 RUN_DIR evaluates RUN_DIR/ckpt_latest.pt; a file evaluates that checkpoint (ckpt_latest.pt or
 model_step_N.pt). Writes <out>/<checkpoint name>_step<N>.json and .csv (default out:
 RUN_DIR/eval). Per set: accuracy with a 95% Wilson interval, number of answers, chance (mean
-1 / #targets), mean loss on final answers; for sets with several queries, the same by (d, b).
+1 / #targets), mean loss on final answers; the same for each sample's first query only
+(first_query_*, free of the elimination heuristic); for sets with several queries, by (d, b).
 """
 import argparse
 import csv
@@ -21,7 +22,8 @@ from .evaluation import evaluate_set, find_sets, load_set
 from .model import LoopedLM, ModelConfig
 
 CSV_FIELDS = ("set", "depth", "branching", "n", "correct", "accuracy", "ci_low", "ci_high", "chance", "loss",
-              "num_samples", "tokens_mean")
+              "num_samples", "tokens_mean", "first_query_n", "first_query_accuracy", "first_query_ci_low",
+              "first_query_ci_high", "first_query_chance")
 
 
 def load_checkpoint(path: str, device) -> tuple:
@@ -39,7 +41,7 @@ def csv_rows(results: dict):
         yield {"set": name, "depth": "", "branching": "", **{k: r.get(k, "") for k in CSV_FIELDS[3:]}}
         for key, s in r.get("by_db", {}).items():
             yield {"set": name, "depth": s["depth"], "branching": s["branching"],
-                   **{k: s.get(k, "") for k in CSV_FIELDS[3:10]}, "num_samples": "", "tokens_mean": ""}
+                   **{k: s.get(k, "") for k in CSV_FIELDS[3:10]}, **{k: "" for k in CSV_FIELDS[10:]}}
 
 
 def main(argv=None):
@@ -66,7 +68,8 @@ def main(argv=None):
         r = evaluate_set(model, load_set(os.path.join(a.suite, name), a.num, a.max_tokens), device)
         results[name] = r
         print(f"{name:28s} acc {r['accuracy']:.4f} [{r['ci_low']:.4f}, {r['ci_high']:.4f}]  n {r['n']:6d}  "
-              f"chance {r['chance']:.4f}  loss {r['loss']:.4f}  ({time.time() - t0:.1f} s)", flush=True)
+              f"chance {r['chance']:.4f}  loss {r['loss']:.4f}  first query {r['first_query_accuracy']:.4f}  "
+              f"({time.time() - t0:.1f} s)", flush=True)
 
     out_dir = a.out or os.path.join(os.path.dirname(path), "eval")
     os.makedirs(out_dir, exist_ok=True)

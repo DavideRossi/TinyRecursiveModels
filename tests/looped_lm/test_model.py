@@ -102,6 +102,7 @@ def test_loss_only_on_masked_positions():
     assert torch.allclose(loss, manual, atol=1e-5)
     assert int(stats["loss_tokens"]) == int(batch["loss_mask"].sum())
     assert int(stats["final_n"]) == int((batch["role"] == 1).sum()) and int(stats["end_n"]) == int((batch["role"] == 5).sum())
+    assert int(stats["first_n"]) == 4  # one first query per sample
     # Unmasking one answer removes exactly its term
     b, t = (batch["role"] == 1).nonzero()[0].tolist()
     fewer = dict(batch, loss_mask=batch["loss_mask"].clone())
@@ -153,6 +154,7 @@ def test_evaluation_uses_pred_pos():
     data = loaded(MULTI, 6)
     r = evaluate_set(NextTokenOracle(offset=1), data, "cpu")
     assert r["n"] == 12 and r["correct"] == 12 and r["accuracy"] == 1.0  # 2 queries x 6 samples
+    assert r["first_query_n"] == 6 and r["first_query_correct"] == 6
     assert abs(r["chance"] - 0.25) < 1e-12 and r["loss"] < 1e-3
     # Read at the answer's own position, the same oracle would be right; the evaluation must not be
     r0 = evaluate_set(NextTokenOracle(offset=0), data, "cpu")
@@ -160,6 +162,7 @@ def test_evaluation_uses_pred_pos():
     # Wrong answers in two samples: 4 of 12 wrong; the interval is Wilson's; per (d, b) counts add up
     r2 = evaluate_set(NextTokenOracle(offset=1, wrong_rows=(1, 4)), data, "cpu")
     assert r2["correct"] == 8 and (r2["ci_low"], r2["ci_high"]) == wilson(8, 12)
+    assert r2["first_query_n"] == 6 and r2["first_query_correct"] == 4  # rows 1 and 4 wrong in both queries
     assert sum(s["n"] for s in r2["by_db"].values()) == 12 and sum(s["correct"] for s in r2["by_db"].values()) == 8
     lo, hi = wilson(8, 12)
     assert 0.39 < lo < 0.40 and 0.86 < hi < 0.87  # 8/12: [0.391, 0.862]

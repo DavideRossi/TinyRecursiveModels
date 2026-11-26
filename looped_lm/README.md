@@ -14,9 +14,10 @@ looped_lm/
   evaluation.py         teacher-forced scoring of final answers on stored sets
   train.py              training loop: python -m looped_lm.train
   evaluate.py           evaluation of a checkpoint: python -m looped_lm.evaluate
+  diagnostics/          MQAR, a check of the training stack (§6)
   data/                 written evaluation suites (ignored by git)
 slurm/train_looped_lm.sbatch, slurm/bench_looped_lm.sbatch
-tests/looped_lm/test_model.py
+tests/looped_lm/test_model.py, tests/looped_lm/test_mqar.py
 ```
 
 ## 1. Model (`model/`)
@@ -132,6 +133,9 @@ current step and stops; the Slurm script forwards Slurm's time-limit signal.
 
 **Logged every `log_interval` = 50 steps** (averages over the interval): `train/loss`,
 `train/final_loss` (final answers only), `train/final_accuracy` (role 1, argmax),
+`train/first_query_accuracy` (the final answers of each sample's first query only: with
+teacher forcing, later queries see the earlier answers and can rule those targets out, the
+`elimination` heuristic, so only the first query has a clean chance level),
 `train/end_accuracy` (role 5), `train/grad_norm` (before clipping), `train/clip_fraction`
 (share of the interval's steps whose norm exceeded `grad_clip`, i.e. were clipped), `train/lr`,
 `train/tokens_per_s` (real tokens; `padded_tokens_per_s` with padding), `train/step_time`,
@@ -143,7 +147,8 @@ time, add workers).
 (`looped_lm/data/eval_suite`): `grid/d1_b1`, `grid/d2_b2`, `grid/d4_b2`, `grid/d8_b1`,
 `grid/d8_b4`, `grid/d16_b4` (d = 16 is outside the training depths 1–8) and
 `mixed/q4_in_distribution`. Per set it logs `eval/<set>/accuracy`, `eval/<set>/loss` (mean
-cross-entropy on final answers), `eval/<set>/chance` and `eval/<set>/n`. **Watch the loss as well
+cross-entropy on final answers), `eval/<set>/chance`, `eval/<set>/n`, and
+`eval/<set>/first_query_accuracy` / `eval/<set>/first_query_chance` (first queries only). **Watch the loss as well
 as the accuracy:** on these tasks accuracy can sit at chance and then jump, and the loss usually
 moves first. The run fails at start if a set is missing (write the suite first, §4). At step 0
 and at every evaluation it also logs the mean and maximum L2 norm of the embedding rows, over
@@ -166,7 +171,10 @@ python -m looped_lm.evaluate --checkpoint checkpoints/looped_lm/RUN/model_step_2
   query of every sample is scored in the same pass.
 - **Per set:** accuracy with a 95% Wilson interval, the number of answers, chance (the mean of
   1 / #targets over the answers), the mean loss on final answers, the number of samples and
-  their mean length. For sets with several queries per sample (the mixed sets), the same by the
+  their mean length; the same for each sample's first query only (`first_query_*`, free of the
+  elimination heuristic: in a sample with q queries and T targets, ruling out the earlier
+  answers alone reaches (1/T + … + 1/(T − q + 1)) / q, e.g. 0.095 for 16 queries over 20
+  targets, against chance 0.05). For sets with several queries per sample (the mixed sets), the same by the
   query's (d, b).
 - **Output:** `<run>/eval/<checkpoint>_step<N>.json` (all results, configs and paths) and `.csv`
   (one row per set, plus one per (d, b) with the `depth` and `branching` columns filled), for
@@ -264,11 +272,51 @@ Interpolating linearly in L between the compiled measurements (an estimate, not 
 At 50k steps the whole sweep (7 models × 2 seeds) is about 24 L40 GPU-hours, less on L40S nodes,
 and every run fits in the 12 h limit. The periodic evaluation adds little (7 sets × 200 samples every 1,000 steps).
 
-## 6. Tests
+## 6. Diagnostics: MQAR (`diagnostics/`)
+
+Multi-query associative recall (Arora et al. 2023, "Zoology"), to check that the training stack
+can learn plain recall, and a ladder of single changes from it towards the graph task.
+
+```
+<bos> k1 v1 k2 v2 ... k16 v16   _ _ k7 v7 _ k2 v2 _ _ k9 v9 ...      (160 tokens)
+```
+
+Keys from the first half of the node names, values from the second half, all distinct; then
+every key once, in random order, at random slots among filler (`<pad>`, as the original's 0),
+each followed by its value. The loss is on each queried value, predicted at its key's position;
+no markers and no end tokens. Chance (copying a random value) is 1/16. The configs in
+`diagnostics/configs/` add one change each, cumulatively:
+
+| config | change |
+|---|---|
+| `mqar_base` | the original format |
+| `mqar_a` | keys and values from one shared vocabulary |
+| `mqar_ab` | pairs written `k > v` |
+| `mqar_abc` | queries written `Q: k ? v`, the value predicted at `?` |
+| `mqar_abcd` | `T:` and the values in random order, after the pairs |
+
+All have 16 pairs and 160 tokens (`mqar_abcd` needs about 130). The next step towards the task
+is the component structure and random edge order of the generator itself
+(`dataset_generation/configs/diag_lookup_q16.json`), which differs from `mqar_abcd` in more
+than one way (filler edges, unqueried targets, end tokens). Train with
+`--data_config looped_lm/diagnostics/configs/mqar_base.json` (the JSON's `"kind": "mqar"`
+selects the stream); the periodic evaluation on the suite is skipped (MQAR samples never repeat,
+so the training metrics are held-out), but the embedding norms are still logged every
+`eval_interval` steps. Use `--pad_multiple 32` with compile, so batches stay at 160 tokens.
+
+## 7. Tests
 
 ```bash
 python tests/looped_lm/test_model.py      # 8 tests, CPU, under a minute
+python tests/looped_lm/test_mqar.py       # 5 tests
 ```
+
+- **MQAR:** the layout of every ladder config (pairs, target list, every key queried once with
+  its value, filler elsewhere, disjoint halves in `mqar_base`); consecutive configs differ by one
+  flag; the stream is deterministic and the same for any number of workers; an oracle stub
+  reading one position ahead gets every answer and every first query right (the loss and
+  prediction positions agree with the objective); a short training run logs the first-query
+  accuracy and the embedding norms without evaluation sets.
 
 - **Causality:** the logits at position t don't change when the tokens after t change.
 - **Loss:** equal to the cross-entropy of the full logits at the masked positions (so the head
