@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from .dataset_generation.vocab import PAD
 
 ROLE_FINAL, ROLE_END = 1, 5
-DEVICE_KEYS = ("tokens", "loss_mask", "role", "pred_pos", "depth", "branching", "query_index")
+DEVICE_KEYS = ("tokens", "loss_mask", "role", "pred_pos", "depth", "branching", "query_index", "after_special")
 
 
 def to_device(batch: dict, device) -> dict:
@@ -30,7 +30,7 @@ def pad_to_multiple(batch: dict, multiple: int) -> dict:
     if not extra:
         return batch
     fill = {"tokens": PAD, "loss_mask": False, "query_index": -1, "depth": 0, "branching": 0, "role": 0,
-            "pred_pos": -1}
+            "pred_pos": -1, "after_special": False}
     out = dict(batch)
     for k, v in fill.items():
         if k in batch:
@@ -50,7 +50,8 @@ def loss_and_stats(model, batch: dict) -> Tuple[torch.Tensor, Dict[str, torch.Te
     """Mean cross-entropy over the loss tokens of the batch, and device-side counts for logging:
     final answers (role 1), the final answers of each sample's first query (query_index 0: no
     earlier answer in the context, so no elimination), and end tokens (role 5), each with the
-    number correct (argmax)."""
+    number correct (argmax). Batches with an after_special field (the induction diagnostic) also
+    count the final answers that follow a special token, and the other final answers."""
     tokens = batch["tokens"]
     hidden = model(tokens)
     b, t = loss_positions(batch["loss_mask"])
@@ -66,4 +67,9 @@ def loss_and_stats(model, batch: dict) -> Tuple[torch.Tensor, Dict[str, torch.Te
              "final_loss_sum": (ce.detach() * final).sum(),
              "first_n": first.sum(), "first_correct": (correct & first).sum(),
              "end_n": end.sum(), "end_correct": (correct & end).sum()}
+    if "after_special" in batch:
+        after = final & batch["after_special"][b, t]
+        other = final & ~after
+        stats.update({"after_special_n": after.sum(), "after_special_correct": (correct & after).sum(),
+                      "other_n": other.sum(), "other_correct": (correct & other).sum()})
     return ce.mean(), stats

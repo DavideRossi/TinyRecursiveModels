@@ -7,7 +7,8 @@ directory (out_dir/run_name) holds config.json, metrics.jsonl, ckpt_latest.pt (f
 resuming) and model_step_N.pt (weights only, every keep_interval steps). Starting a run whose
 directory has ckpt_latest.pt resumes it: the model, the optimizer, the schedule step and the data
 position (batch j of the stream is a pure function of (data_seed, j), so the stream restarts at
-the step). SIGUSR1 or SIGTERM (Slurm's time limit, see slurm/train_looped_lm.sbatch) saves a
+the step); a run started with --init_from takes only the model weights of that checkpoint, with a
+fresh optimizer, schedule and data stream (ignored when resuming). SIGUSR1 or SIGTERM (Slurm's time limit, see slurm/train_looped_lm.sbatch) saves a
 checkpoint and stops.
 """
 import argparse
@@ -26,6 +27,7 @@ from torch.utils.data import DataLoader
 
 from .dataset_generation.config import TaskConfig
 from .dataset_generation.dataset import TrainStream
+from .diagnostics.induction import InductionConfig, InductionStream, is_induction
 from .diagnostics.mqar import MqarConfig, MqarStream, is_mqar
 from .evaluation import evaluate_set, load_set
 from .model import LoopedLM, ModelConfig
@@ -42,6 +44,7 @@ class TrainConfig:
     data_config: str = "looped_lm/dataset_generation/configs/train.json"
     answer_format: str = ""                          # "": the data config's; otherwise overrides it
     allow_small_pool: bool = False                   # diagnostics only: train on a config with pool_size < 2048
+    init_from: str = ""                              # checkpoint (ckpt_latest.pt or model_step_N.pt): its model weights only
     batch_size: int = 64
     steps: int = 50000
     lr: float = 1e-3
@@ -96,13 +99,13 @@ def param_groups(model: LoopedLM, weight_decay: float):
 
 
 def load_task(cfg: TrainConfig):
-    """The data config: a TaskConfig, or an MqarConfig (diagnostics; its JSON has "kind": "mqar")."""
+    """The data config: a TaskConfig, or a diagnostic config (its JSON has "kind": "mqar" or "induction")."""
     with open(cfg.data_config) as f:
         d = json.load(f)
-    if is_mqar(d):
+    if is_mqar(d) or is_induction(d):
         if cfg.answer_format:
-            raise ValueError("--answer_format does not apply to an MQAR config")
-        return MqarConfig.from_dict(d)
+            raise ValueError(f"--answer_format does not apply to a {d['kind']} config")
+        return MqarConfig.from_dict(d) if is_mqar(d) else InductionConfig.from_dict(d)
     task = TaskConfig.from_dict(d)
     return task.replace(answer_format=cfg.answer_format) if cfg.answer_format else task
 
@@ -175,6 +178,18 @@ def _check_resume(saved: dict, model_cfg: ModelConfig, cfg: TrainConfig, task: T
                          f"use another run_name or out_dir")
 
 
+def init_weights(model: LoopedLM, path: str, model_cfg: ModelConfig, device) -> None:
+    """Load the model weights of a checkpoint (ckpt_latest.pt or model_step_N.pt) into model; the
+    model configs must agree."""
+    saved = torch.load(path, map_location=device, weights_only=False)
+    theirs, ours = saved["model_config"], model_cfg.to_dict()
+    diff = sorted(k for k in set(theirs) | set(ours) if theirs.get(k) != ours.get(k))
+    if diff:
+        raise ValueError(f"--init_from {path}: model config differs in " +
+                         ", ".join(f"{k} ({theirs.get(k)} there, {ours.get(k)} here)" for k in diff))
+    model.load_state_dict(saved["model"])
+
+
 def train(cfg: TrainConfig, model_cfg: ModelConfig, task: Optional[TaskConfig] = None,
           stop_after: Optional[int] = None, record_losses: bool = False) -> dict:
     """Train (or resume) a run. stop_after: stop with a checkpoint once this step is reached, as if
@@ -199,7 +214,10 @@ def train(cfg: TrainConfig, model_cfg: ModelConfig, task: Optional[TaskConfig] =
         optimizer.load_state_dict(saved["optimizer"])
         step = saved["step"]
         print(f"resumed {cfg.run_dir} at step {step}", flush=True)
-    elif not bench:
+    elif cfg.init_from:
+        init_weights(model, cfg.init_from, model_cfg, device)
+        print(f"{cfg.run_dir}: model weights from {cfg.init_from}", flush=True)
+    if step == 0 and not bench:
         with open(os.path.join(cfg.run_dir, "config.json"), "w") as f:
             json.dump(configs, f, indent=1)
     if step >= cfg.steps:
@@ -215,9 +233,10 @@ def train(cfg: TrainConfig, model_cfg: ModelConfig, task: Optional[TaskConfig] =
             _save(os.path.join(cfg.run_dir, f"model_step_{step}.pt"),
                   {k: payload[k] for k in ("model", "step", "model_config", "train_config", "task_config")})
 
-    mqar = isinstance(task, MqarConfig)
-    if mqar:
-        stream = MqarStream(task, seed=cfg.stream_seed, batch_size=cfg.batch_size, start=step)
+    diagnostic = isinstance(task, (MqarConfig, InductionConfig))
+    if diagnostic:
+        cls = MqarStream if isinstance(task, MqarConfig) else InductionStream
+        stream = cls(task, seed=cfg.stream_seed, batch_size=cfg.batch_size, start=step)
     else:
         stream = TrainStream(task, seed=cfg.stream_seed, batch_size=cfg.batch_size, start=step,
                              allow_small_pool=cfg.allow_small_pool)
@@ -228,7 +247,7 @@ def train(cfg: TrainConfig, model_cfg: ModelConfig, task: Optional[TaskConfig] =
     pad_multiple = cfg.pad_multiple or (128 if cfg.compile else 1)
 
     eval_data = {}
-    if cfg.eval_interval > 0 and not bench and not mqar:  # MQAR: the stream itself is held out (no sample repeats)
+    if cfg.eval_interval > 0 and not bench and not diagnostic:  # diagnostics: the stream is held out (no repeats)
         for name in [s for s in cfg.eval_sets.split(",") if s]:
             path = os.path.join(cfg.eval_suite, name)
             if not os.path.exists(os.path.join(path, "meta.json")):
@@ -296,6 +315,11 @@ def train(cfg: TrainConfig, model_cfg: ModelConfig, task: Optional[TaskConfig] =
                             "train/final_accuracy": a["final_correct"] / max(1, a["final_n"]),
                             "train/first_query_accuracy": a["first_correct"] / max(1, a["first_n"]),
                             "train/end_accuracy": a["end_correct"] / max(1, a["end_n"]),
+                            **({"train/after_special_accuracy": a["after_special_correct"] / max(1, a["after_special_n"]),
+                                "train/other_accuracy": a["other_correct"] / max(1, a["other_n"]),
+                                "train/after_special_share": a["after_special_n"] / max(1, a["final_n"]),
+                                "train/supervised_fraction": a["loss_tokens"] / max(1, a["real_tokens"])}
+                               if "after_special_n" in a else {}),
                             "train/grad_norm": a["grad_norm"] / a["steps"], "train/clip_fraction": a["clipped"] / a["steps"],
                             "train/lr": lr_at(step - 1, cfg),
                             "train/tokens_per_s": a["real_tokens"] / dt, "train/padded_tokens_per_s": a["padded_tokens"] / dt,

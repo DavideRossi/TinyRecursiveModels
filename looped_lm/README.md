@@ -14,7 +14,7 @@ looped_lm/
   evaluation.py         teacher-forced scoring of final answers on stored sets
   train.py              training loop: python -m looped_lm.train
   evaluate.py           evaluation of a checkpoint: python -m looped_lm.evaluate
-  diagnostics/          MQAR, a check of the training stack (§6)
+  diagnostics/          MQAR and induction pretraining, checks of the training stack (§6)
   data/                 written evaluation suites (ignored by git)
 slurm/train_looped_lm.sbatch, slurm/bench_looped_lm.sbatch
 tests/looped_lm/test_model.py, tests/looped_lm/test_mqar.py
@@ -130,6 +130,12 @@ A resumed run must have the same model config, task config, batch size, seeds an
 format, or it refuses to start. `steps` may change (e.g. to extend a run; the cosine then
 follows the new length). **SIGUSR1 or SIGTERM** saves `ckpt_latest.pt` at the end of the
 current step and stops; the Slurm script forwards Slurm's time-limit signal.
+
+**`--init_from PATH`** (`ckpt_latest.pt` or `model_step_N.pt` of another run): the new run
+starts from that checkpoint's model weights only; the optimizer, the schedule (warm-up
+included) and the data stream start fresh. The model configs must agree, or the run refuses to
+start. A run directory that already has `ckpt_latest.pt` resumes from it and ignores
+`init_from`, so a requeued job continues its own run. `init_from` is saved in `config.json`.
 
 **Logged every `log_interval` = 50 steps** (averages over the interval): `train/loss`,
 `train/final_loss` (final answers only), `train/final_accuracy` (role 1, argmax),
@@ -272,7 +278,9 @@ Interpolating linearly in L between the compiled measurements (an estimate, not 
 At 50k steps the whole sweep (7 models × 2 seeds) is about 24 L40 GPU-hours, less on L40S nodes,
 and every run fits in the 12 h limit. The periodic evaluation adds little (7 sets × 200 samples every 1,000 steps).
 
-## 6. Diagnostics: MQAR (`diagnostics/`)
+## 6. Diagnostics (`diagnostics/`)
+
+### MQAR
 
 Multi-query associative recall (Arora et al. 2023, "Zoology"), to check that the training stack
 can learn plain recall, and a ladder of single changes from it towards the graph task.
@@ -304,12 +312,57 @@ selects the stream); the periodic evaluation on the suite is skipped (MQAR sampl
 so the training metrics are held-out), but the embedding norms are still logged every
 `eval_interval` steps. Use `--pad_multiple 32` with compile, so batches stay at 160 tokens.
 
+### Two-phase diagnostic: induction pretraining, then the task
+
+Phase 1 trains copying in the vocabulary of the graph task
+(`diagnostics/induction.py`, `diagnostics/configs/induction.json`); phase 2 trains the graph
+task from those weights (`--init_from`), with a fresh optimizer and schedule. A phase 1
+sample is `<bos>` and segments, up to a length drawn from 100–300 tokens:
+
+```
+<bos> n1098 n1377 n1901 n1135 n667 ... T: n868 ; n1611 n562  [T: n868 ; n1611]  n1901 [n1135 n667] ...
+                                                                  ^ repeat of a fresh segment ^ fragment
+```
+
+- **Fresh segments** of 4–16 tokens: node names, unique within the sample, and special tokens
+  (`>`, `T:`, `Q:`, `?`, `[`, `]`, `<bt>`, `;`) placed between names, never first, last or
+  next to another special (each interior slot after a name with probability 0.33).
+- **Repeats** (probability 0.65 per segment once a fresh one exists): an earlier fresh segment,
+  whole or (half the time) from a random offset on a name to its end, at least 3 tokens.
+  Fragments run to the end so that every copy of a segment ends where the segment does; a copy
+  ending mid-segment would give its last name a second continuation in the context.
+- **Loss** on every token of a repeat but its first (in brackets above; role 1, so
+  `train/final_accuracy` is the accuracy on supervised tokens), about half the tokens.
+- **After-special tokens**: supervised tokens whose predecessor is a special token, which
+  recurs all over the sample; only the name before it identifies the span, as `x` identifies `t`
+  in `x > t`. The others need only one-token induction (a name occurs in one segment and its
+  copies). Logged separately: `train/after_special_accuracy`, `train/other_accuracy`,
+  `train/after_special_share`, `train/supervised_fraction` (supervised / real tokens).
+
+Measured over 5,000 samples: supervised fraction per sample 0.50 on average (5–95%:
+0.33–0.66), after-special share 0.226 of the supervised tokens, special-token density 0.20, mean
+length 200. The after-special share is about the density of specials in the copied
+text (each such token needs its own special before it), so the 20% target needs about 20%
+specials. `python -m looped_lm.diagnostics.induction CONFIG` prints these statistics and an
+example.
+
 ## 7. Tests
 
 ```bash
 python tests/looped_lm/test_model.py      # 8 tests, CPU, under a minute
 python tests/looped_lm/test_mqar.py       # 5 tests
+python tests/looped_lm/test_induction.py  # 5 tests
 ```
+
+- **Induction:** every supervised token is determined by the context (each earlier occurrence
+  of its one or two preceding tokens, ending in a name, is followed by it); never two specials in
+  a row; the first token of a repeat is unsupervised; names outside repeats are unique;
+  `after_special` marks exactly the supervised tokens after a special; the supervised fraction
+  and after-special share are in range; the stream is deterministic and worker-independent; the
+  oracle stub gets every supervised token right and the after-special / other split adds up; a
+  short run logs the split metrics; `--init_from` loads the weights exactly (with lr 0 one step
+  changes nothing), starts a fresh optimizer at step 0, refuses another model config, and
+  yields to resuming.
 
 - **MQAR:** the layout of every ladder config (pairs, target list, every key queried once with
   its value, filler elsewhere, disjoint halves in `mqar_base`); consecutive configs differ by one

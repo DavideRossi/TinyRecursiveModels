@@ -3,5 +3,5 @@
     dataset_generation/   the data: generator, checker, audit, suites, PyTorch datasets
     model/                the model family (ModelConfig, LoopedLM)
     train.py, evaluate.py training and evaluation (python -m looped_lm.train / looped_lm.evaluate)
-    diagnostics/          MQAR, a check of the training stack
+    diagnostics/          MQAR and induction pretraining, checks of the training stack
 """
