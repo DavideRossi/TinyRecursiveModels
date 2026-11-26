@@ -1,6 +1,7 @@
 """Model configuration: every hyperparameter of the model family, saved as JSON with each run."""
 import dataclasses
 import json
+import math
 
 from ..dataset_generation.vocab import VOCAB
 
@@ -10,8 +11,10 @@ class ModelConfig:
     """embedding -> prelude (P layers) -> core (C layers) x n_loops -> coda (K layers) -> RMSNorm -> head
 
     width: residual stream size d; num_heads x head_dim: attention size (= width by default)
-    mlp_hidden: SwiGLU hidden size m; init_std: std of every weight at initialization (the output
-    projections of attention and MLP get init_std / sqrt(2 * num_layers))."""
+    mlp_hidden: SwiGLU hidden size m; init_std: std of every weight at initialization except the
+    embedding (the output projections of attention and MLP get init_std / sqrt(2 * num_layers));
+    embed_init_std: std of the (tied) embedding, 0 for 1 / sqrt(width), resolved at construction
+    so that the saved config holds the value used."""
     vocab_size: int = VOCAB.size
     width: int = 256
     num_heads: int = 4
@@ -25,6 +28,7 @@ class ModelConfig:
     rope_base: float = 10000.0
     norm_eps: float = 1e-5
     init_std: float = 0.02
+    embed_init_std: float = 0.0
 
     def __post_init__(self):
         if self.head_dim % 2:
@@ -34,6 +38,10 @@ class ModelConfig:
                 raise ValueError(f"{k} must be >= 1")
         if min(self.prelude_layers, self.core_layers, self.coda_layers) < 0 or self.num_layers < 1:
             raise ValueError("layer counts must be >= 0, with at least one layer")
+        if self.embed_init_std < 0:
+            raise ValueError("embed_init_std must be >= 0 (0: 1 / sqrt(width))")
+        if self.embed_init_std == 0:
+            self.embed_init_std = 1.0 / math.sqrt(self.width)
 
     @property
     def num_layers(self) -> int:

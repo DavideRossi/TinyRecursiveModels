@@ -1,0 +1,13 @@
+{
+ "name": "easy_short",
+ "targets_mode": "fixed",
+ "depth": {"range": [1, 2]},
+ "branching": {"range": [1, 2]},
+ "num_queries": {"range": [1, 4]},
+ "num_targets": {"range": [5, 12]},
+ "total_edges": {"range": [32, 64]},
+ "edge_order": "random",
+ "targets_position": "after",
+ "answer_format": "direct",
+ "pool_size": 2048
+}

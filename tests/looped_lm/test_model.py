@@ -63,7 +63,14 @@ def test_structure_and_initialization():
     o = torch.cat([b.attn.o_proj.weight.flatten() for b in m.core] + [b.mlp.down_proj.weight.flatten() for b in m.core])
     q = torch.cat([b.attn.qkv_proj.weight.flatten() for b in m.core])
     assert abs(o.std().item() - out_std) / out_std < 0.02 and abs(q.std().item() - 0.02) / 0.02 < 0.02
-    assert abs(m.embed.weight.std().item() - 0.02) < 0.001
+    # The embedding: 1 / sqrt(width) by default, or the given std; the config saves the value used
+    assert m.config.embed_init_std == 1 / 16 and ModelConfig.from_dict(m.config.to_dict()).embed_init_std == 1 / 16
+    assert abs(m.embed.weight.std().item() - 1 / 16) < 0.001
+    assert abs(LoopedLM(ModelConfig(width=512, num_heads=8, mlp_hidden=1408, core_layers=1)).embed.weight.std().item()
+               - 512 ** -0.5) < 0.001
+    assert abs(LoopedLM(ModelConfig(**dict(TINY, embed_init_std=0.02))).embed.weight.std().item() - 0.02) < 0.001
+    norms = m.embed_norms()
+    assert abs(norms["embed_norm_mean"] - 1.0) < 0.02 and norms["embed_norm_names_max"] <= norms["embed_norm_max"]
     assert all(torch.equal(p, torch.ones_like(p)) for n, p in m.named_parameters() if n.endswith("norm.weight"))
     assert not any(isinstance(x, torch.nn.Linear) and x.bias is not None for x in m.modules())
     # Tied head: logits are hidden states times the embedding

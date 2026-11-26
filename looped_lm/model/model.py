@@ -33,12 +33,14 @@ class LoopedLM(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        """Normal(0, init_std) everywhere; attention and MLP output projections scaled by
-        1 / sqrt(2 * num_layers); norm gains 1."""
+        """Normal(0, init_std) everywhere except the embedding, Normal(0, embed_init_std); attention
+        and MLP output projections scaled by 1 / sqrt(2 * num_layers); norm gains 1."""
         std, out_std = self.config.init_std, self.config.init_std / math.sqrt(2 * self.config.num_layers)
         for name, p in self.named_parameters():
             if name.endswith("norm.weight"):
                 nn.init.ones_(p)
+            elif name == "embed.weight":
+                nn.init.normal_(p, 0.0, self.config.embed_init_std)
             elif name.endswith("o_proj.weight") or name.endswith("down_proj.weight"):
                 nn.init.normal_(p, 0.0, out_std)
             else:
@@ -67,6 +69,16 @@ class LoopedLM(nn.Module):
     def logits(self, tokens: torch.Tensor) -> torch.Tensor:
         """Full logits [B, S, V] (tests and inspection; training computes the head at loss positions only)."""
         return self.head(self(tokens))
+
+    @torch.no_grad()
+    def embed_norms(self) -> dict:
+        """Mean and maximum L2 norm of the embedding rows (= the head's rows, tied), over the
+        whole vocabulary and over the node names only."""
+        from ..dataset_generation.vocab import VOCAB
+        norms = self.embed.weight.float().norm(dim=1)
+        names = torch.tensor([VOCAB.is_node(i) for i in range(len(norms))], device=norms.device)
+        return {"embed_norm_mean": norms.mean().item(), "embed_norm_max": norms.max().item(),
+                "embed_norm_names_mean": norms[names].mean().item(), "embed_norm_names_max": norms[names].max().item()}
 
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())

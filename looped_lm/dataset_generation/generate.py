@@ -296,7 +296,7 @@ def make_sample(config: TaskConfig, seed: int, index: int, split: str = "train",
     for qi, c in enumerate(queried):
         prompt_pos = len(toks)
         emit([QUERY, c.source, ASK], q=qi, d=c.depth, b=c.branching)
-        ids, rls = answer_tokens(config.answer_format, c.branches, c.target_branch)
+        ids, rls = answer_tokens(config.answer_format, c.branches, c.target_branch, c.source)
         answer_start = len(toks)
         emit(ids, q=qi, d=c.depth, b=c.branching, m=True, role_list=rls)
         answer_end = len(toks)

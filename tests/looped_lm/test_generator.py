@@ -63,7 +63,7 @@ def test_checker_accepts_every_configuration():
                      distractor_branching=[1, 5], answer_format="dfs")
     for i in range(50):
         check_sample(make_sample(cfg, 0, i), "dfs")
-    assert n == 600
+    assert n == 25 * len(ANSWER_FORMATS) * len(EDGE_ORDERS) * len(TARGET_POSITIONS) == 750
 
 
 def test_edge_count_and_targets():
@@ -199,7 +199,8 @@ def test_loss_mask():
             assert len(finals) == len(s.queries)
             assert np.array_equal(s.pred_pos[finals], finals - 1)
             assert (s.pred_pos[s.role != formats.ROLE_FINAL] == -1).all()
-            assert [int(s.tokens[f]) for f in finals] == [q["target"] for q in s.queries]
+            final_of = "source" if fmt == "copy" else "target"
+            assert [int(s.tokens[f]) for f in finals] == [q[final_of] for q in s.queries]
 
 
 def test_query_order_independent_of_graph_order():
@@ -545,6 +546,30 @@ def test_suite_fixed_grid_companions_diag():
         r = audit_mod.audit(specs[cell].config, 400)
         assert r["depth_match"]["flag"] == "" and abs(r["depth_match"]["chance"] - 1 / 8) < 1e-12, (cell, r["depth_match"])
 
+
+
+def test_copy_format():
+    """Pipeline check format: the answer is the queried name (the token right after "Q:"), predicted
+    from "?"; the checker accepts it and rejects it as any other format."""
+    cfg = TaskConfig(**FIXED, answer_format="copy")
+    for i in range(40):
+        s = make_sample(cfg, 0, i)
+        check_sample(s, "copy", num_targets=s.num_targets)
+        answers = np.nonzero(s.role == formats.ROLE_FINAL)[0]
+        assert len(answers) == len(s.queries)
+        for a, q in zip(answers, s.queries):
+            assert s.tokens[a] == q["source"] == s.tokens[a - 2] and s.pred_pos[a] == a - 1
+        try:
+            check_sample(s, "direct", num_targets=s.num_targets)
+        except CheckError:
+            pass
+        else:
+            raise AssertionError("a copy answer must fail as 'direct'")
+    # The same sample in direct format differs only in the answers
+    d = make_sample(cfg.replace(answer_format="direct"), 0, 3)
+    c = make_sample(cfg, 0, 3)
+    differ = np.nonzero(d.tokens != c.tokens)[0]
+    assert len(differ) and all(c.role[k] == formats.ROLE_FINAL for k in differ)
 
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

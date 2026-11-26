@@ -160,10 +160,13 @@ class Graph:
         return out
 
 
-def expected_answer(fmt: str, branches: List[List[int]], target_branch: int) -> Tuple[List[int], List[int]]:
+def expected_answer(fmt: str, branches: List[List[int]], target_branch: int,
+                    source: int = -1) -> Tuple[List[int], List[int]]:
     """Answer tokens and roles, rebuilt independently of formats.py."""
     path = branches[target_branch]
     t = path[-1]
+    if fmt == "copy":
+        return [source], [FINAL]
     if fmt == "direct":
         return [t], [FINAL]
     if fmt == "path":
@@ -253,7 +256,7 @@ def analyze(tokens: Sequence[int], fmt: str, vocab: Vocab = VOCAB, num_targets: 
         path = path[::-1]
         brs = sorted(components[s], key=lambda b: g.edge_index[(s, b[0])])
         tb = [b[-1] for b in brs].index(t)
-        ids, roles = expected_answer(fmt, brs, tb)
+        ids, roles = expected_answer(fmt, brs, tb, s)
         if q["answer"] != ids:
             raise CheckError(f"query {qi}: answer {vocab.decode(q['answer'])} != expected {vocab.decode(ids)} ({fmt})")
         queries.append({"source": s, "target": t, "path": path, "depth": len(path), "branching": len(brs),

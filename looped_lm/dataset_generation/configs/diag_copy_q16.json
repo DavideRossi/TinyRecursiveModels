@@ -1,0 +1,13 @@
+{
+ "name": "copy_q16",
+ "targets_mode": "fixed",
+ "depth": {"range": [1, 1]},
+ "branching": {"range": [1, 1]},
+ "num_queries": 16,
+ "num_targets": 20,
+ "total_edges": {"range": [32, 64]},
+ "edge_order": "random",
+ "targets_position": "after",
+ "answer_format": "copy",
+ "pool_size": 2048
+}

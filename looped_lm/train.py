@@ -39,7 +39,7 @@ class TrainConfig:
     run_name: str = "looped_lm"
     out_dir: str = "checkpoints/looped_lm"           # the run directory is out_dir/run_name
     data_config: str = "looped_lm/dataset_generation/configs/train.json"
-    answer_format: str = "direct"
+    answer_format: str = ""                          # "": the data config's; otherwise overrides it
     batch_size: int = 64
     steps: int = 50000
     lr: float = 1e-3
@@ -94,7 +94,8 @@ def param_groups(model: LoopedLM, weight_decay: float):
 
 
 def load_task(cfg: TrainConfig) -> TaskConfig:
-    return TaskConfig.load(cfg.data_config).replace(answer_format=cfg.answer_format)
+    task = TaskConfig.load(cfg.data_config)
+    return task.replace(answer_format=cfg.answer_format) if cfg.answer_format else task
 
 
 class _Stop:
@@ -157,7 +158,7 @@ def _check_resume(saved: dict, model_cfg: ModelConfig, cfg: TrainConfig, task: T
         problems.append("model config")
     if saved["task_config"] != task.to_dict():
         problems.append("task config")
-    for k in ("batch_size", "seed", "data_seed", "answer_format"):
+    for k in ("batch_size", "seed", "data_seed"):  # the answer format is part of the task config
         if saved["train_config"][k] != getattr(cfg, k):
             problems.append(k)
     if problems:
@@ -225,7 +226,8 @@ def train(cfg: TrainConfig, model_cfg: ModelConfig, task: Optional[TaskConfig] =
     old_handlers = {s: signal.signal(s, stop) for s in (signal.SIGUSR1, signal.SIGTERM)}
     logger = None if bench else _Logger(cfg, configs, step)
     if logger is not None and step == 0:
-        logger.log({"num_params": model.num_params()}, step=0)
+        logger.log({"num_params": model.num_params(), **{f"model/{k}": v for k, v in model.embed_norms().items()}},
+                   step=0)
 
     def run_eval():
         out = {}
@@ -233,6 +235,7 @@ def train(cfg: TrainConfig, model_cfg: ModelConfig, task: Optional[TaskConfig] =
             r = evaluate_set(model, data, device)
             out.update({f"eval/{name}/accuracy": r["accuracy"], f"eval/{name}/loss": r["loss"],
                         f"eval/{name}/chance": r["chance"], f"eval/{name}/n": r["n"]})
+        out.update({f"model/{k}": v for k, v in model.embed_norms().items()})
         return out
 
     losses: List[float] = []

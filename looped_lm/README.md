@@ -38,8 +38,19 @@ tokens -> embedding -> prelude (P layers) -> core (C layers) x n_loops -> coda (
   model is then P + C + K distinct layers.
 - **Head:** tied to the input embedding (`logits = h @ E^T`). Training applies it only at the
   positions that predict loss tokens; `model.logits(tokens)` gives the full logits.
-- **Initialization:** every weight normal with std 0.02; the output projections of attention
-  (`o_proj`) and MLP (`down_proj`) with std 0.02 / √(2 × (P + C + K)); norm gains 1.
+- **Initialization:** the embedding normal with std 1/√d (`embed_init_std`; 0.0625 at width 256,
+  0.044 at 512), so each row starts with norm about 1; every other weight normal with std 0.02;
+  the output projections of attention (`o_proj`) and MLP (`down_proj`) with std
+  0.02 / √(2 × (P + C + K)); norm gains 1.
+  - **Why the embedding is larger than 0.02:** with the tied head, a logit is the final-normed
+    hidden state (norm about √d) times an embedding row, so the largest logit the model can give
+    a token is about √d × that row's norm. At std 0.02 and width 256 that is about 5, too little
+    to concentrate the probability on one of 2,048 names, and the rows can only grow when their
+    names occur, which is rarely: every node name is a rare token. With 0.02 the model stayed at
+    the uniform loss for thousands of steps, even on a task that only asks to copy the queried
+    name; with 1/√d a small model learned that copy in about 400 steps (CPU probe, width 128).
+    The mean and maximum row norms (all tokens, and node names only) are logged at step 0 and at
+    every evaluation as `model/embed_norm_*`.
 - **Vocabulary:** from the dataset package (2,059 tokens: 11 specials and 2,048 node names).
 - **Rotary embeddings:** `rotate_half`, `apply_rotary_pos_emb` and `RotaryEmbedding` are copied
   from the TRM code (`models/layers.py`), so this package doesn't import it. Everything else is
@@ -58,7 +69,8 @@ tokens -> embedding -> prelude (P layers) -> core (C layers) x n_loops -> coda (
 | `max_positions` | 8192 | longest sequence (rotary table); the companion sets reach 4,623 tokens |
 | `rope_base` | 10000 | |
 | `norm_eps` | 1e-5 | |
-| `init_std` | 0.02 | |
+| `init_std` | 0.02 | every weight except the embedding |
+| `embed_init_std` | 1/√width | 0 in the config means 1/√width; the saved config holds the value |
 
 **Parameters:** V·d + d + L·(4·d·(heads × head_dim) + 3·d·m + 2·d), checked by a test:
 
@@ -80,8 +92,8 @@ python -m looped_lm.train --run_name NAME --core_layers 8 --width 256 --seed 0 [
 Every field of `TrainConfig` and `ModelConfig` is an option (`--field value`; booleans take
 `true`/`false`).
 
-- **Data:** `TrainStream` of `dataset_generation` on `configs/train.json` with
-  `answer_format` (default `direct`), batches of 64 built in the stream (one edge count per
+- **Data:** `TrainStream` of `dataset_generation` on `configs/train.json` (`--data_config`),
+  with the config's answer format unless `--answer_format` overrides it, batches of 64 built in the stream (one edge count per
   batch), a `DataLoader` with `batch_size=None` and `num_workers` workers (default 7). The stream
   seed is `data_seed`, or `seed` when `data_seed` is −1 (the default), so two seeds differ in both
   initialization and data.
@@ -129,7 +141,10 @@ time, add workers).
 `mixed/q4_in_distribution`. Per set it logs `eval/<set>/accuracy`, `eval/<set>/loss` (mean
 cross-entropy on final answers), `eval/<set>/chance` and `eval/<set>/n`. **Watch the loss as well
 as the accuracy:** on these tasks accuracy can sit at chance and then jump, and the loss usually
-moves first. The run fails at start if a set is missing (write the suite first, §4).
+moves first. The run fails at start if a set is missing (write the suite first, §4). At step 0
+and at every evaluation it also logs the mean and maximum L2 norm of the embedding rows, over
+the whole vocabulary (`model/embed_norm_mean`, `model/embed_norm_max`) and over the node names
+(`model/embed_norm_names_mean`, `model/embed_norm_names_max`), to follow the logit scale (§1).
 
 **Benchmark mode** (`--benchmark true --steps 300`): no evaluation, logs or checkpoints; prints
 one JSON line with the median step time (after 30 untimed steps), the median data wait and the
@@ -162,27 +177,39 @@ python -m looped_lm.evaluate --checkpoint checkpoints/looped_lm/RUN/model_step_2
 
 ## 4. On the cluster
 
-1. **Write the evaluation suite** once (it is not in git), from the repo root:
+1. **Get the evaluation suite to the cluster** once (it is not in git; 162 MB). Generation is
+   deterministic, so either copy a suite written elsewhere:
    ```bash
-   apptainer exec /scratch.hpc/$USER/trm.sif python -m looped_lm.dataset_generation.cli write \
-       --suite looped_lm/dataset_generation/configs/eval_suite.json --check
+   ssh <cluster> "mkdir -p <repo>/looped_lm/data"
+   rsync -a looped_lm/data/eval_suite/ <cluster>:<repo>/looped_lm/data/eval_suite/
    ```
-   It takes a few minutes on the CPU and writes `looped_lm/data/eval_suite/` (162 MB).
+   or write it on a compute node (apptainer isn't available on the login node), from the repo
+   root:
+   ```bash
+   srun --partition=l40s --cpus-per-task=4 --mem=8G --time=00:30:00 \
+       apptainer exec /scratch.hpc/$USER/trm.sif python -m looped_lm.dataset_generation.cli write \
+           --suite looped_lm/dataset_generation/configs/eval_suite.json --check
+   ```
+   Writing takes a few minutes on the CPU and creates `looped_lm/data/eval_suite/`.
 2. **Benchmark:** `sbatch slurm/bench_looped_lm.sbatch` times L = 2 and L = 16 at width 256 and
    L = 8 at width 512, each with and without `torch.compile`, 300 steps each.
 3. **Pilot:** L = 8, width 256, 50,000 steps, evaluated every 1,000 steps:
    ```bash
-   RUN_NAME=pilot_L8_w256_s0 DEPTH=8 WIDTH=256 SEED=0 sbatch slurm/train_looped_lm.sbatch --steps 50000
+   RUN_NAME=pilot_L8_w256_s0 DEPTH=8 WIDTH=256 SEED=0 sbatch slurm/train_looped_lm.sbatch \
+       --steps 50000 --compile true
    ```
-   Add `--compile true` if the benchmark shows it pays. The step count of the sweep follows from
-   where the pilot's evaluation loss and accuracy flatten.
+   About 1.6 h (§5). The step count of the sweep follows from where the pilot's evaluation loss
+   and accuracy flatten.
 4. **Sweep** (STEPS from the pilot):
    ```bash
    for L in 2 4 6 8 12 16; do for S in 0 1; do
-       RUN_NAME=base_L${L}_w256_s${S} DEPTH=$L WIDTH=256 SEED=$S sbatch slurm/train_looped_lm.sbatch --steps $STEPS
+       C=$([ $L -ge 4 ] && echo true || echo false)    # compile is slower at L = 2 (§5)
+       RUN_NAME=base_L${L}_w256_s${S} DEPTH=$L WIDTH=256 SEED=$S sbatch slurm/train_looped_lm.sbatch \
+           --steps $STEPS --compile $C
    done; done
    for S in 0 1; do
-       RUN_NAME=base_L8_w512_s${S} DEPTH=8 WIDTH=512 SEED=$S sbatch slurm/train_looped_lm.sbatch --steps $STEPS
+       RUN_NAME=base_L8_w512_s${S} DEPTH=8 WIDTH=512 SEED=$S sbatch slurm/train_looped_lm.sbatch \
+           --steps $STEPS --compile true
    done
    ```
 5. **Evaluate** each run: `apptainer exec --nv ... python -m looped_lm.evaluate --checkpoint
@@ -194,19 +221,44 @@ and logs to wandb offline unless `WANDB_API_KEY` is set (`wandb sync <run>/wandb
 later). Slurm signals it 5 minutes before the time limit (12 h by default); the run saves its
 checkpoint and stops, and **submitting the same command again resumes it**.
 
-## 5. Throughput (estimate, to be replaced by the benchmark)
+## 5. Throughput (measured)
 
-A step is about 64 × 1,087 ≈ 70k tokens. Counting matrix products and causal attention (mean
-context about 600 tokens), forward and backward:
+`slurm/bench_looped_lm.sbatch` on one **L40** (the L40S nodes were busy), batch 64 (about 70k
+tokens per step), bf16 autocast, median over steps 31–300:
 
-| model | TFLOP per step | step time at 15–30% of the L40S's 362 TFLOPS | 30k steps |
-|---|---:|---:|---:|
-| L = 2, width 256 | 0.93 | 10–20 ms | ~10 min |
-| L = 16, width 256 | 7.5 | 70–140 ms | 0.6–1.2 h |
-| L = 8, width 512 | 12.9 | 120–240 ms | 1–2 h |
+| model | parameters | eager | `--compile true` | peak memory (eager / compiled) | 50k steps, faster mode |
+|---|---:|---:|---:|---:|---:|
+| L = 2, width 256 | 2.13 M | **52 ms** | 68 ms | 3.2 / 2.6 GB | 0.7 h |
+| L = 16, width 256 | 13.4 M | 344 ms | **175 ms** | 21.5 / 17.2 GB | 2.4 h |
+| L = 8, width 512 | 26.8 M | 388 ms | **187 ms** | 22.2 / 17.8 GB | 2.6 h |
 
-Data generation costs about 1.1 ms per sample per worker, so about 10 ms per batch with 7
-workers: the smallest model may be data-bound (watch `train/data_wait`).
+- **Compile halves the step time of the larger models** and is slower at L = 2, where the step is
+  dominated by fixed per-step overhead (kernel launches) rather than arithmetic; it also pads to a
+  multiple of 128 tokens. Use it for L ≥ 4. L = 4 was not measured; by linear interpolation both
+  modes are close there (about 83 ms compiled, 94 ms eager).
+- **Data generation is not a bottleneck:** the median wait for a batch is under 0.5 ms with 7
+  workers, for every model.
+- **Memory** peaks at 22 GB of the 48 GB (the same on the L40 and the L40S), so batch 64 fits
+  every model of the sweep.
+- **Against the FLOP count** (0.93, 7.5 and 12.9 TFLOP per step, forward and backward), compiled
+  L = 16 runs at about 43 TFLOPS and compiled L = 8 at width 512 at about 69 TFLOPS, 24% and 38%
+  of the L40's 181 TFLOPS dense bf16 peak.
+- **On an L40S** (the same chip, memory and bandwidth; 362 TFLOPS dense bf16, twice the L40's)
+  the matrix products can run up to twice as fast, while the memory-bound operations (norms,
+  activations, softmax) and the per-step overhead do not change. So the times above are an
+  upper bound: the larger models should be faster by somewhat less than 2×, L = 2 about the same,
+  and the advantage of compile is likely larger, since what it fuses is the part that doesn't
+  speed up. Runs may land on either GPU; this changes their speed, not their results.
+
+Interpolating linearly in L between the compiled measurements (an estimate, not measured):
+
+| L at width 256 | 2 | 4 | 6 | 8 | 12 | 16 | L = 8, width 512 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| step time | 52 ms | ~83 ms | ~98 ms | ~114 ms | ~144 ms | 175 ms | 187 ms |
+| 50k steps | 0.7 h | 1.2 h | 1.4 h | 1.6 h | 2.0 h | 2.4 h | 2.6 h |
+
+At 50k steps the whole sweep (7 models × 2 seeds) is about 24 L40 GPU-hours, less on L40S nodes,
+and every run fits in the 12 h limit. The periodic evaluation adds little (7 sets × 200 samples every 1,000 steps).
 
 ## 6. Tests
 
@@ -225,8 +277,9 @@ python tests/looped_lm/test_model.py      # 8 tests, CPU, under a minute
 - **Parameter counts** match the formula (also with prelude and coda, and heads × head_dim ≠
   width) and the figures above.
 - **Structure and initialization:** `n_loops = 2` raises; layer counts; standard deviations of
-  the embedding, the projections and the scaled output projections; norm gains 1; no biases;
-  tied head.
+  the embedding (1/√width by default, or the given value, saved in the config), the projections
+  and the scaled output projections; norm gains 1; no biases; tied head; the logged embedding
+  norms.
 - **Learning-rate schedule** values at the warm-up, the middle and the end.
 - **Overfitting:** a tiny model reaches a loss below 0.05 on one fixed batch.
 - **Resuming:** a run stopped at step 6 and resumed gives the same losses on steps 7–12 as an

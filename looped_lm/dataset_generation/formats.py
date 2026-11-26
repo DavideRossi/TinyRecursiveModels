@@ -10,11 +10,18 @@ ROLE_OTHER, ROLE_FINAL, ROLE_INTERMEDIATE, ROLE_BRACKET, ROLE_BACKTRACK, ROLE_EN
 ROLE_NAMES = ["other", "final", "intermediate", "bracket", "backtrack", "end"]
 
 
-def answer_tokens(fmt: str, branches: Sequence[Sequence[int]], target_branch: int) -> Tuple[List[int], List[int]]:
-    """(token ids, roles) of the answer to a query, without the end token (; or EOS)."""
+def answer_tokens(fmt: str, branches: Sequence[Sequence[int]], target_branch: int,
+                  source: int = -1) -> Tuple[List[int], List[int]]:
+    """(token ids, roles) of the answer to a query, without the end token (; or EOS). source: the
+    queried node (needed by "copy" only)."""
     path = list(branches[target_branch])
     target = path[-1]
-    if fmt == "direct":
+    if fmt == "copy":  # pipeline check: the answer is the queried name itself
+        if source < 0:
+            raise ValueError("answer format 'copy' needs the source")
+        ids = [source]
+        roles = [ROLE_FINAL]
+    elif fmt == "direct":
         ids = [target]
         roles = [ROLE_FINAL]
     elif fmt == "path":
@@ -43,5 +50,5 @@ def answer_tokens(fmt: str, branches: Sequence[Sequence[int]], target_branch: in
 
 def max_answer_length(fmt: str, depth: int, branching: int) -> int:
     """Answer tokens (without the end token) in the worst case for one query."""
-    return {"direct": 1, "path": depth, "frontier": depth * (branching + 2) + 1,
+    return {"copy": 1, "direct": 1, "path": depth, "frontier": depth * (branching + 2) + 1,
             "dfs": branching * depth + branching - 1}[fmt]

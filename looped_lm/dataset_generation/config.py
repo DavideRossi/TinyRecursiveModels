@@ -11,7 +11,7 @@ from .vocab import NODE_POOL
 
 EDGE_ORDERS = ("random", "reverse", "forward")
 TARGET_POSITIONS = ("after", "before")
-ANSWER_FORMATS = ("direct", "path", "frontier", "dfs")
+ANSWER_FORMATS = ("direct", "path", "frontier", "dfs", "copy")
 TARGETS_MODES = ("per_component", "fixed")
 
 
@@ -108,7 +108,8 @@ class TaskConfig:
                 smaller than total_edges (the rest is padding); None: total_edges
     edge_order: random | reverse (each edge after its successor) | forward (each edge before it)
     targets_position: after | before the edges
-    answer_format: direct | path | frontier | dfs
+    answer_format: direct | path | frontier | dfs | copy (a pipeline check: the answer is the
+                   queried name itself, the token right after "Q:")
     pool_size: node names are drawn from the first pool_size names of the vocabulary
     """
     name: str = "default"
