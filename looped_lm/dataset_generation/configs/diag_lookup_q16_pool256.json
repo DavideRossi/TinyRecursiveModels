@@ -1,0 +1,13 @@
+{
+ "name": "lookup_q16_pool256",
+ "targets_mode": "fixed",
+ "depth": {"range": [1, 1]},
+ "branching": {"range": [1, 1]},
+ "num_queries": 16,
+ "num_targets": 20,
+ "total_edges": {"range": [32, 64]},
+ "edge_order": "random",
+ "targets_position": "after",
+ "answer_format": "direct",
+ "pool_size": 256
+}

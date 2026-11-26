@@ -40,6 +40,7 @@ class TrainConfig:
     out_dir: str = "checkpoints/looped_lm"           # the run directory is out_dir/run_name
     data_config: str = "looped_lm/dataset_generation/configs/train.json"
     answer_format: str = ""                          # "": the data config's; otherwise overrides it
+    allow_small_pool: bool = False                   # diagnostics only: train on a config with pool_size < 2048
     batch_size: int = 64
     steps: int = 50000
     lr: float = 1e-3
@@ -206,7 +207,8 @@ def train(cfg: TrainConfig, model_cfg: ModelConfig, task: Optional[TaskConfig] =
             _save(os.path.join(cfg.run_dir, f"model_step_{step}.pt"),
                   {k: payload[k] for k in ("model", "step", "model_config", "train_config", "task_config")})
 
-    stream = TrainStream(task, seed=cfg.stream_seed, batch_size=cfg.batch_size, start=step)
+    stream = TrainStream(task, seed=cfg.stream_seed, batch_size=cfg.batch_size, start=step,
+                         allow_small_pool=cfg.allow_small_pool)
     loader = DataLoader(stream, batch_size=None, num_workers=cfg.num_workers, pin_memory=device.type == "cuda",
                         prefetch_factor=4 if cfg.num_workers > 0 else None,
                         persistent_workers=False)

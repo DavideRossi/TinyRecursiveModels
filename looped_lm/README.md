@@ -97,6 +97,9 @@ Every field of `TrainConfig` and `ModelConfig` is an option (`--field value`; bo
   batch), a `DataLoader` with `batch_size=None` and `num_workers` workers (default 7). The stream
   seed is `data_seed`, or `seed` when `data_seed` is −1 (the default), so two seeds differ in both
   initialization and data.
+  The stream refuses configs drawing names from fewer than the 2,048 names (`pool_size`) unless
+  `--allow_small_pool true` is given: diagnostics only (the evaluation suite uses the full pool,
+  so names outside the small pool are never trained).
 - **Loss:** next-token cross-entropy on the positions where `loss_mask` is true: the logits at
   t − 1 predict the token at t. These are the answer tokens and the end token (`;` / `<eos>`)
   after each answer, about 5 per sample in the direct format. The loss is the mean over the loss
