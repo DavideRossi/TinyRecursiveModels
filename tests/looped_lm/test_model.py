@@ -166,6 +166,46 @@ def test_evaluation_uses_pred_pos():
     assert sum(s["n"] for s in r2["by_db"].values()) == 12 and sum(s["correct"] for s in r2["by_db"].values()) == 8
     lo, hi = wilson(8, 12)
     assert 0.39 < lo < 0.40 and 0.86 < hi < 0.87  # 8/12: [0.391, 0.862]
+    # First queries by depth and by branching: the queries of each value, adding up to the first queries
+    first = [(int(batch_d), int(batch_b), row) for row, (batch_d, batch_b) in enumerate(first_query_db(data["batches"][0]))]
+    for key, col, prefix in (("first_query_by_depth", 0, "d"), ("first_query_by_branching", 1, "b")):
+        split = r2[key]
+        values = sorted({q[col] for q in first})
+        assert len(values) > 1 and sorted(split) == sorted(f"{prefix}{v}" for v in values), (key, split.keys())
+        for v in values:
+            rows = [q[2] for q in first if q[col] == v]
+            assert split[f"{prefix}{v}"]["n"] == len(rows)
+            assert split[f"{prefix}{v}"]["correct"] == sum(row not in (1, 4) for row in rows)
+    # A set whose first queries all have one d and b gets no split
+    one = TaskConfig(targets_mode="fixed", depth=2, branching=2, num_queries=1, num_targets=3, total_edges=12)
+    r1 = evaluate_set(NextTokenOracle(offset=1), loaded(one, 4), "cpu")
+    assert "first_query_by_depth" not in r1 and "first_query_by_branching" not in r1
+
+
+def first_query_db(batch):
+    """(d, b) of each sample's first query, by row."""
+    out = []
+    for row in range(batch["tokens"].shape[0]):
+        m = (batch["role"][row] == 1) & (batch["query_index"][row] == 0)
+        d, b = batch["depth"][row][m].unique(), batch["branching"][row][m].unique()
+        assert len(d) == 1 and len(b) == 1
+        out.append((int(d), int(b)))
+    return out
+
+
+def test_first_query_counts_by_depth_and_branching():
+    """The objective's first-query counts by d and b: the first queries of each value, adding up to
+    first_n / first_correct; bin 0 stays empty on the graph task."""
+    batch = batch_of(MULTI, 8)
+    db = first_query_db(batch)
+    _, stats = loss_and_stats(NextTokenOracle(offset=1, wrong_rows=(2, 5)), batch)
+    for key, col in (("depth", 0), ("branching", 1)):
+        n, k = stats[f"first_n_by_{key}"].tolist(), stats[f"first_correct_by_{key}"].tolist()
+        assert sum(n) == int(stats["first_n"]) == 8 and sum(k) == int(stats["first_correct"]) == 6
+        assert n[0] == 0
+        for v in range(1, len(n)):
+            assert n[v] == sum(q[col] == v for q in db)
+            assert k[v] == sum(q[col] == v and row not in (2, 5) for row, q in enumerate(db))
 
 
 def test_learning_rate_schedule():
@@ -200,6 +240,14 @@ def test_resume_reproduces_uninterrupted_run():
         assert second["step"] == 12 and len(second["losses"]) == 6
         assert np.allclose(first["losses"], full["losses"][:6], rtol=0, atol=1e-7)
         assert np.allclose(second["losses"], full["losses"][6:], rtol=0, atol=1e-6), (second["losses"], full["losses"][6:])
+        # Training logs first-query accuracy by d and b (TASK: d, b in 1-2), never a bin 0
+        import json
+        rows = [json.loads(l) for l in open(os.path.join(d, "full", "metrics.jsonl"))]
+        split = [{k: v for k, v in r.items() if k.startswith("train/first_query_accuracy_")} for r in rows
+                 if "train/loss" in r]
+        assert split and all(s for s in split)
+        assert {k for s in split for k in s} <= {f"train/first_query_accuracy_{p}{v}" for p in "db" for v in (1, 2)}
+        assert all(0.0 <= v <= 1.0 for s in split for v in s.values())
         # A different model or data stream refuses to resume
         try:
             train(TrainConfig(run_name="split", out_dir=d, **dict(common, steps=20, seed=1)), model_cfg, TASK)

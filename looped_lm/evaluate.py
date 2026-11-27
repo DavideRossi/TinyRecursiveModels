@@ -7,7 +7,8 @@ RUN_DIR evaluates RUN_DIR/ckpt_latest.pt; a file evaluates that checkpoint (ckpt
 model_step_N.pt). Writes <out>/<checkpoint name>_step<N>.json and .csv (default out:
 RUN_DIR/eval). Per set: accuracy with a 95% Wilson interval, number of answers, chance (mean
 1 / #targets), mean loss on final answers; the same for each sample's first query only
-(first_query_*, free of the elimination heuristic); for sets with several queries, by (d, b).
+(first_query_*, free of the elimination heuristic); for sets with several queries, by (d, b);
+for sets mixing depths or branchings, first queries by depth and by branching (JSON only).
 """
 import argparse
 import csv

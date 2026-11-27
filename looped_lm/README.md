@@ -153,7 +153,8 @@ again does nothing (exit status 3). It costs N steps; see the two-phase recipe i
 `train/first_query_accuracy` (the final answers of each sample's first query only: with
 teacher forcing, later queries see the earlier answers and can rule those targets out, the
 `elimination` heuristic, so only the first query has a clean chance level),
-`train/end_accuracy` (role 5), `train/grad_norm` (before clipping), `train/clip_fraction`
+`train/first_query_accuracy_d<d>` and `_b<b>` (the same by the first query's depth and by its
+branching, for the values present in the interval; graph tasks only), `train/end_accuracy` (role 5), `train/grad_norm` (before clipping), `train/clip_fraction`
 (share of the interval's steps whose norm exceeded `grad_clip`, i.e. were clipped), `train/lr`,
 `train/tokens_per_s` (real tokens; `padded_tokens_per_s` with padding), `train/step_time`,
 `train/data_wait` (time per step spent waiting for the DataLoader; if it approaches the step
@@ -165,7 +166,8 @@ time, add workers).
 `grid/d8_b4`, `grid/d16_b4` (d = 16 is outside the training depths 1–8) and
 `mixed/q4_in_distribution`. Per set it logs `eval/<set>/accuracy`, `eval/<set>/loss` (mean
 cross-entropy on final answers), `eval/<set>/chance`, `eval/<set>/n`, and
-`eval/<set>/first_query_accuracy` / `eval/<set>/first_query_chance` (first queries only). **Watch the loss as well
+`eval/<set>/first_query_accuracy` / `eval/<set>/first_query_chance` (first queries only), and
+for sets that mix depths (branchings) `eval/<set>/first_query_accuracy_d<d>` (`_b<b>`). **Watch the loss as well
 as the accuracy:** on these tasks accuracy can sit at chance and then jump, and the loss usually
 moves first. The run fails at start if a set is missing (write the suite first, §4). At step 0
 and at every evaluation it also logs the mean and maximum L2 norm of the embedding rows, over
@@ -175,8 +177,9 @@ the whole vocabulary (`model/embed_norm_mean`, `model/embed_norm_max`) and over 
 **Held-out sets of a training config (`cfg/<name>`):** the `configs` section of
 `configs/eval_suite.json` turns a training config into a fixed set of the same distribution
 (the eval split, so never a sample of the training stream). It holds `cfg/lookup_q16` and
-`cfg/lookup_long` (1,000 samples each of `diag_lookup_q16.json` and `diag_lookup_long.json`);
-add one entry per training config used. Write only these
+`cfg/lookup_long` (1,000 samples each of `diag_lookup_q16.json` and `diag_lookup_long.json`)
+and `cfg/train` (2,000 samples of `train.json`, about 250 first queries per depth); add one
+entry per training config used. Write only these
 sets with `cli write --suite looped_lm/dataset_generation/configs/eval_suite.json --only cfg/`
 (seconds; the other sets are untouched), and evaluate on them with e.g.
 `--eval_sets cfg/lookup_q16,grid/d1_b1 --eval_samples 1000`.
@@ -425,7 +428,7 @@ it.
 ## 7. Tests
 
 ```bash
-python tests/looped_lm/test_model.py      # 8 tests, CPU, under a minute
+python tests/looped_lm/test_model.py      # 9 tests, CPU, under a minute
 python tests/looped_lm/test_mqar.py       # 5 tests
 python tests/looped_lm/test_induction.py  # 8 tests
 ```
@@ -438,7 +441,7 @@ python tests/looped_lm/test_induction.py  # 8 tests
   `after_special` marks exactly the supervised tokens after a special; the supervised fraction
   and after-special share are in range; the stream is deterministic and worker-independent; the
   oracle stub gets every supervised token right and the after-special / other split adds up; a
-  short run logs the split metrics; `--init_from` loads the weights exactly (with lr 0 one step
+  short run logs the split metrics (and no first-query accuracy by depth); `--init_from` loads the weights exactly (with lr 0 one step
   changes nothing), starts a fresh optimizer at step 0, refuses another model config, and
   yields to resuming. The gate: a passing gate lets the run finish; a failing one stops at
   the gate step without a checkpoint, writes `gate.json`, logs `gate/passed` 0, is not
@@ -457,12 +460,16 @@ python tests/looped_lm/test_induction.py  # 8 tests
   accuracy and the embedding norms without evaluation sets.
 
 - **Causality:** the logits at position t don't change when the tokens after t change.
+- **First queries by d and b:** the objective's counts by depth and by branching match the
+  first queries of each value and add up to `first_n` / `first_correct`; a short training run
+  logs `train/first_query_accuracy_d<d>` / `_b<b>` for the task's values only.
 - **Loss:** equal to the cross-entropy of the full logits at the masked positions (so the head
   at loss positions only is exact); unmasking one answer removes exactly its term; padding never
   contributes (arbitrary tokens in place of `<pad>`, or each sample alone, give the same loss).
 - **Evaluation:** with an oracle stub whose hidden state at position p encodes the token at
   p + 1, every answer is correct, chance and the Wilson interval are right, and the (d, b)
-  breakdown adds up; the same oracle shifted to the answer's own position scores 0, so
+  breakdown adds up; the first-query results by depth and by branching count each value's first
+  queries and add up, and a set with a single d and b has none; the same oracle shifted to the answer's own position scores 0, so
   `pred_pos` is what is used.
 - **Parameter counts** match the formula (also with prelude and coda, and heads × head_dim ≠
   width) and the figures above.

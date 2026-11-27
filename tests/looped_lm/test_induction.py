@@ -179,6 +179,7 @@ def test_training_and_init_from():
         for k in ("after_special_accuracy", "other_accuracy", "after_special_share", "supervised_fraction"):
             assert all(f"train/{k}" in r for r in logs), k
         assert all(0.2 < r["train/supervised_fraction"] < 0.8 for r in logs)
+        assert not any(k.startswith("train/first_query_accuracy_") for r in logs for k in r)  # no d, b here
         ckpt = os.path.join(d, "p1", "ckpt_latest.pt")
         w1 = torch.load(ckpt, weights_only=False)["model"]
 

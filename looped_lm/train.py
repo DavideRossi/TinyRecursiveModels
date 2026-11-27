@@ -297,6 +297,8 @@ def train(cfg: TrainConfig, model_cfg: ModelConfig, task: Optional[TaskConfig] =
                         f"eval/{name}/chance": r["chance"], f"eval/{name}/n": r["n"],
                         f"eval/{name}/first_query_accuracy": r["first_query_accuracy"],
                         f"eval/{name}/first_query_chance": r["first_query_chance"]})
+            for key in ("first_query_by_depth", "first_query_by_branching"):  # sets mixing d (b) only
+                out.update({f"eval/{name}/first_query_accuracy_{k}": s["accuracy"] for k, s in r.get(key, {}).items()})
         out.update({f"model/{k}": v for k, v in model.embed_norms().items()})
         return out
 
@@ -335,7 +337,12 @@ def train(cfg: TrainConfig, model_cfg: ModelConfig, task: Optional[TaskConfig] =
                          padded_tokens=torch.tensor(batch["tokens"].numel(), device=device))
             acc = stats if acc is None else {k: acc[k] + stats[k] for k in acc}
             if step % cfg.log_interval == 0 or step == cfg.steps:
-                a = {k: float(v) for k, v in acc.items()}
+                a = {k: (v.tolist() if v.dim() else float(v)) for k, v in acc.items()}
+                by_db = {}  # first-query accuracy by the query's d and b (graph tasks; bin 0: no d, b)
+                for key, prefix in (("depth", "d"), ("branching", "b")):
+                    n, k = a[f"first_n_by_{key}"], a[f"first_correct_by_{key}"]
+                    by_db.update({f"train/first_query_accuracy_{prefix}{i}": k[i] / n[i]
+                                  for i in range(1, len(n)) if n[i] > 0})
                 dt = time.time() - t_last
                 if cfg.gate_step and step == cfg.gate_step:
                     metric = gate_metric(task)
@@ -357,7 +364,7 @@ def train(cfg: TrainConfig, model_cfg: ModelConfig, task: Optional[TaskConfig] =
                                 "train/other_accuracy": a["other_correct"] / max(1, a["other_n"]),
                                 "train/after_special_share": a["after_special_n"] / max(1, a["final_n"]),
                                 "train/supervised_fraction": a["loss_tokens"] / max(1, a["real_tokens"])}
-                               if "after_special_n" in a else {}),
+                               if "after_special_n" in a else {}), **by_db,
                             "train/grad_norm": a["grad_norm"] / a["steps"], "train/clip_fraction": a["clipped"] / a["steps"],
                             "train/lr": lr_at(step - 1, cfg),
                             "train/tokens_per_s": a["real_tokens"] / dt, "train/padded_tokens_per_s": a["padded_tokens"] / dt,

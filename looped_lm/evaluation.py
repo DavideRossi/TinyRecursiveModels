@@ -77,7 +77,9 @@ def evaluate_set(model, loaded: dict, device, amp: bool = True, by_db: Optional[
     """Accuracy of final answers with a 95% interval, number of answers, chance (mean 1 / #targets),
     mean loss on final answers; the same for each sample's first query only (first_query_*: no
     earlier answer in the context, so the elimination heuristic can't help); for sets with several
-    queries per sample, also by the query's (d, b)."""
+    queries per sample, also by the query's (d, b); for sets whose first queries have several
+    depths (branchings), first-query results by depth (first_query_by_depth["d1"], ...) and by
+    branching (first_query_by_branching["b1"], ...)."""
     was_training = model.training
     model.eval()
     cols = {k: [] for k in ("correct", "loss", "depth", "branching", "query_index", "chance")}
@@ -100,6 +102,11 @@ def evaluate_set(model, loaded: dict, device, amp: bool = True, by_db: Optional[
                 "loss": float(c["loss"][m].mean()) if n else float("nan")}
     out = summary(np.ones(len(c["correct"]), dtype=bool))
     out.update({f"first_query_{k}": v for k, v in summary(c["query_index"] == 0).items()})
+    first = c["query_index"] == 0
+    for key, col, prefix in (("first_query_by_depth", "depth", "d"), ("first_query_by_branching", "branching", "b")):
+        values = sorted(set(c[col][first].tolist()))
+        if len(values) > 1:
+            out[key] = {f"{prefix}{int(v)}": summary(first & (c[col] == v)) for v in values}
     out["num_samples"] = loaded["num_samples"]
     out["tokens_mean"] = loaded["tokens_mean"]
     if by_db is None:

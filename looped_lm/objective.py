@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from .dataset_generation.vocab import PAD
 
 ROLE_FINAL, ROLE_END = 1, 5
+MAX_DEPTH, MAX_BRANCHING = 32, 8  # bins of the first-query counts by d and b (larger values go in the last)
 DEVICE_KEYS = ("tokens", "loss_mask", "role", "pred_pos", "depth", "branching", "query_index", "after_special")
 
 
@@ -50,7 +51,9 @@ def loss_and_stats(model, batch: dict) -> Tuple[torch.Tensor, Dict[str, torch.Te
     """Mean cross-entropy over the loss tokens of the batch, and device-side counts for logging:
     final answers (role 1), the final answers of each sample's first query (query_index 0: no
     earlier answer in the context, so no elimination), and end tokens (role 5), each with the
-    number correct (argmax). Batches with an after_special field (the induction diagnostic) also
+    number correct (argmax). The first queries are also counted by the query's d and b
+    (first_n_by_depth[d], first_correct_by_depth[d], and _by_branching; bin 0 holds the tasks
+    without d and b: MQAR, induction). Batches with an after_special field (the induction diagnostic) also
     count the final answers that follow a special token, and the other final answers."""
     tokens = batch["tokens"]
     hidden = model(tokens)
@@ -67,6 +70,11 @@ def loss_and_stats(model, batch: dict) -> Tuple[torch.Tensor, Dict[str, torch.Te
              "final_loss_sum": (ce.detach() * final).sum(),
              "first_n": first.sum(), "first_correct": (correct & first).sum(),
              "end_n": end.sum(), "end_correct": (correct & end).sum()}
+    for key, top in (("depth", MAX_DEPTH), ("branching", MAX_BRANCHING)):
+        v = batch[key][b, t].clamp(0, top).long()
+        bins = torch.zeros(top + 1, dtype=torch.long, device=v.device)  # fixed size: no host sync (bincount has one)
+        stats[f"first_n_by_{key}"] = bins.index_add(0, v, first.long())
+        stats[f"first_correct_by_{key}"] = bins.index_add(0, v, (first & correct).long())
     if "after_special" in batch:
         after = final & batch["after_special"][b, t]
         other = final & ~after
