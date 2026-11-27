@@ -224,9 +224,13 @@ python -m looped_lm.evaluate --checkpoint checkpoints/looped_lm/RUN/model_step_2
    root:
    ```bash
    srun --partition=l40s --cpus-per-task=4 --mem=8G --time=00:30:00 \
-       apptainer exec /scratch.hpc/$USER/trm.sif python -m looped_lm.dataset_generation.cli write \
-           --suite looped_lm/dataset_generation/configs/eval_suite.json --check
+       apptainer exec --bind /scratch.hpc/$USER --pwd "$PWD" /scratch.hpc/$USER/trm.sif \
+           python -m looped_lm.dataset_generation.cli write \
+               --suite looped_lm/dataset_generation/configs/eval_suite.json --check
    ```
+   `--bind` makes the repo (under `/scratch.hpc`) visible in the container and `--pwd "$PWD"`
+   starts there; without them the container starts in your home directory and `looped_lm` is
+   not found. Add `--only cfg/` to write only the held-out sets of training configs (§2).
    Writing takes a few minutes on the CPU and creates `looped_lm/data/eval_suite/`.
 2. **Benchmark:** `sbatch slurm/bench_looped_lm.sbatch` times L = 2 and L = 16 at width 256 and
    L = 8 at width 512, each with and without `torch.compile`, 300 steps each.
