@@ -1,0 +1,13 @@
+{
+ "name": "lookup_long",
+ "targets_mode": "fixed",
+ "depth": {"range": [1, 1]},
+ "branching": {"range": [1, 1]},
+ "num_queries": 4,
+ "num_targets": {"range": [5, 12]},
+ "total_edges": {"range": [192, 512]},
+ "edge_order": "random",
+ "targets_position": "after",
+ "answer_format": "direct",
+ "pool_size": 2048
+}

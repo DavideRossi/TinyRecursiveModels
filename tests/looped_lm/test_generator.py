@@ -297,6 +297,17 @@ def test_suite_configs_section():
         assert not np.array_equal(ev.tokens, tr.tokens)
 
 
+def test_eval_suite_held_out_configs():
+    """The suite's cfg/ sets are the training configs they name, under their set name."""
+    specs = {x.name: x for x in suite.expand(suite.load(SUITE)) if x.name.startswith("cfg/")}
+    assert set(specs) == {"cfg/lookup_q16", "cfg/lookup_long"}
+    for name, file in (("cfg/lookup_q16", "diag_lookup_q16.json"), ("cfg/lookup_long", "diag_lookup_long.json")):
+        cfg = TaskConfig.from_dict(json.load(open(os.path.join(os.path.dirname(SUITE), file))))
+        assert specs[name].config.to_dict() == cfg.replace(name=name).to_dict() and specs[name].num_samples == 1000
+    long = specs["cfg/lookup_long"].config
+    assert (long.num_queries.max, long.num_targets.min, long.total_edges.min, long.total_edges.max) == (4, 5, 192, 512)
+
+
 def test_audit_at_chance_and_detects_a_planted_shortcut():
     cfg = TaskConfig(depth=3, branching=3, num_queries=1, num_distractors=5, total_edges=54)
     r = audit_mod.audit(cfg, 600)

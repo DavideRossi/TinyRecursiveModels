@@ -11,6 +11,9 @@ A sample is <bos> followed by segments until its length (drawn from [min_len, ma
                     segment does: a copy ending mid-segment would give its last name a second,
                     different continuation (the next segment) in the context.
 
+The length is drawn per sample, or (length_per_batch) once per batch, so that a batch has no
+padding: the graph stream does the same with its edge counts.
+
 A segment is a repeat with probability repeat_prob (once a fresh segment exists). The loss is on
 every token of a repeat except its first (role 1, so train/final_accuracy is the accuracy on the
 supervised tokens), predicted at the previous position as everywhere.
@@ -29,7 +32,7 @@ prints the supervised fraction per sample, the share of after-special tokens and
 import argparse
 import dataclasses
 import json
-from typing import Iterator
+from typing import Iterator, Optional
 
 import numpy as np
 import torch
@@ -54,6 +57,7 @@ class InductionConfig:
     fragment_prob: float = 0.5
     min_fragment: int = 3
     special_prob: float = 0.33     # per interior slot of a fresh segment, if the previous token is a name
+    length_per_batch: bool = False  # one length per batch (no padding) instead of one per sample
 
     def __post_init__(self):
         if not 2 <= self.min_len <= self.max_len:
@@ -100,8 +104,10 @@ def _fresh_segment(cfg: InductionConfig, rng: np.random.Generator, names: Iterat
     return seg
 
 
-def make_sample(cfg: InductionConfig, rng: np.random.Generator) -> dict:
-    length = int(rng.integers(cfg.min_len, cfg.max_len + 1))
+def make_sample(cfg: InductionConfig, rng: np.random.Generator, length: Optional[int] = None) -> dict:
+    """One sample; its length is drawn from [min_len, max_len] unless given."""
+    if length is None:
+        length = int(rng.integers(cfg.min_len, cfg.max_len + 1))
     perm = rng.permutation(NODE_POOL)
     names = iter(VOCAB.node(int(i)) for i in perm)
     toks, sup, seg_id, offset = [BOS], [False], [-1], [-1]
@@ -154,7 +160,8 @@ def collate(samples: list) -> dict:
 def make_batch(cfg: InductionConfig, seed: int, j: int, batch_size: int) -> dict:
     """Batch j of the stream: deterministic in (seed, j)."""
     rng = np.random.default_rng(np.random.SeedSequence([3000, seed, j]))
-    return collate([make_sample(cfg, rng) for _ in range(batch_size)])
+    length = int(rng.integers(cfg.min_len, cfg.max_len + 1)) if cfg.length_per_batch else None
+    return collate([make_sample(cfg, rng, length) for _ in range(batch_size)])
 
 
 class InductionStream(IterableDataset):

@@ -25,6 +25,7 @@ from looped_lm.train import TrainConfig, load_task, train  # noqa: E402
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
 CONFIG = os.path.join(ROOT, "looped_lm", "diagnostics", "configs", "induction.json")
+LONG = os.path.join(ROOT, "looped_lm", "diagnostics", "configs", "induction_long.json")
 LOOKUP = os.path.join(ROOT, "looped_lm", "dataset_generation", "configs", "diag_lookup_q16.json")
 TINY = dict(width=32, num_heads=2, head_dim=16, mlp_hidden=64, core_layers=1)
 
@@ -96,6 +97,25 @@ def test_segment_offset_and_special_swap():
     name, pair = score(matcher_predictor(False), probe), score(matcher_predictor(True), probe)
     assert name["swapped_accuracy"] == name["control_accuracy"] == 1.0 and name["n"] > 1000
     assert pair["control_accuracy"] == 1.0 and pair["swapped_accuracy"] == 0.0
+
+
+def test_length_per_batch_and_long_config():
+    """induction_long: one length per batch (no padding), lengths over 100-1600 across batches, the
+    same supervised fraction and after-special share as the short config."""
+    cfg = InductionConfig.load(LONG)
+    assert cfg.length_per_batch and (cfg.min_len, cfg.max_len) == (100, 1600)
+    lengths = []
+    for j in range(40):
+        b = make_batch(cfg, 0, j, 8)
+        assert (b["length"] == b["length"][0]).all() and b["tokens"].shape[1] == int(b["length"][0])
+        assert (b["tokens"] != PAD).all()
+        lengths.append(int(b["length"][0]))
+    assert min(lengths) < 500 and max(lengths) > 1100
+    d = describe(cfg, num=200)
+    assert 0.45 <= d["supervised_fraction_mean"] <= 0.58 and d["after_special_share"] >= 0.2, d
+    short = InductionConfig.load(CONFIG)
+    assert not short.length_per_batch
+    assert len({int(n) for n in make_batch(short, 0, 0, 16)["length"]}) > 1   # per sample, as before
 
 
 def test_statistics():
@@ -220,6 +240,16 @@ def test_gate():
                 "--mlp_hidden", "64", "--core_layers", "1", "--batch_size", "4"]
         assert main(argv) == GATE_FAILED
         assert max(json.loads(l)["step"] for l in open(os.path.join(d, "bad", "metrics.jsonl"))) == 4
+
+        # Record-only: the gate is written and logged, the run continues, and it can be resubmitted
+        rec = _cfg(d, "rec", LOOKUP, steps=6, gate_step=4, gate_first_query=1.0, gate_enforce=False)
+        out = train(rec, ModelConfig(**TINY))
+        assert out["step"] == 6 and not out["gate_failed"]
+        gate = json.load(open(os.path.join(d, "rec", "gate.json")))
+        assert not gate["passed"] and not gate["enforced"]
+        rows = [json.loads(l) for l in open(os.path.join(d, "rec", "metrics.jsonl"))]
+        assert [r["gate/passed"] for r in rows if "gate/passed" in r] == [0] and max(r["step"] for r in rows) == 6
+        assert train(dataclasses.replace(rec, steps=8), ModelConfig(**TINY))["step"] == 8
 
         for kw in (dict(gate_step=3), dict(gate_step=8)):  # not a multiple of log_interval 2; beyond steps
             try:

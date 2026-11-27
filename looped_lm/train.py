@@ -10,7 +10,8 @@ position (batch j of the stream is a pure function of (data_seed, j), so the str
 the step); a run started with --init_from takes only the model weights of that checkpoint, with a
 fresh optimizer, schedule and data stream (ignored when resuming). With --gate_step N, the run stops
 at step N (exit status 3, no checkpoint, gate.json in the run directory) unless the first-query
-accuracy of the last log interval is above --gate_first_query. SIGUSR1 or SIGTERM (Slurm's time limit, see slurm/train_looped_lm.sbatch) saves a
+accuracy of the last log interval is above --gate_first_query (--gate_enforce false: only record
+it). SIGUSR1 or SIGTERM (Slurm's time limit, see slurm/train_looped_lm.sbatch) saves a
 checkpoint and stops.
 """
 import argparse
@@ -50,6 +51,7 @@ class TrainConfig:
     init_from: str = ""                              # checkpoint (ckpt_latest.pt or model_step_N.pt): its model weights only
     gate_step: int = 0                               # 0: off; else stop at this step unless first-query accuracy passes
     gate_first_query: float = 0.9                    # the gate: train/first_query_accuracy above this at gate_step
+    gate_enforce: bool = True                        # false: record the gate (gate.json, gate/passed) but never stop
     batch_size: int = 64
     steps: int = 50000
     lr: float = 1e-3
@@ -211,7 +213,7 @@ def train(cfg: TrainConfig, model_cfg: ModelConfig, task: Optional[TaskConfig] =
     if cfg.gate_step and not cfg.benchmark and os.path.exists(gate_path):
         with open(gate_path) as f:
             gate = json.load(f)
-        if not gate["passed"]:
+        if not gate["passed"] and gate.get("enforced", True):
             print(f"{cfg.run_dir}: failed its gate at step {gate['step']} (first-query accuracy "
                   f"{gate['first_query_accuracy']:.3f}); not restarting it", flush=True)
             return {"step": gate["step"], "losses": [], "gate_failed": True}
@@ -333,11 +335,12 @@ def train(cfg: TrainConfig, model_cfg: ModelConfig, task: Optional[TaskConfig] =
                 if cfg.gate_step and step == cfg.gate_step:
                     fq = a["first_correct"] / max(1, a["first_n"])
                     gate = {"step": step, "first_query_accuracy": fq, "threshold": cfg.gate_first_query,
-                            "passed": fq > cfg.gate_first_query, "init_from": cfg.init_from}
+                            "passed": fq > cfg.gate_first_query, "enforced": cfg.gate_enforce,
+                            "init_from": cfg.init_from}
                     with open(gate_path, "w") as f:
                         json.dump(gate, f, indent=1)
                     logger.log({"gate/first_query_accuracy": fq, "gate/passed": int(gate["passed"])}, step=step)
-                    gate_failed = not gate["passed"]
+                    gate_failed = cfg.gate_enforce and not gate["passed"]
                 logger.log({"train/loss": a["loss_sum"] / max(1, a["loss_tokens"]),
                             "train/final_loss": a["final_loss_sum"] / max(1, a["final_n"]),
                             "train/final_accuracy": a["final_correct"] / max(1, a["final_n"]),

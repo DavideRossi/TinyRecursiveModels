@@ -144,7 +144,8 @@ status 3, so a Slurm job ends as FAILED. Either way it writes `gate.json` (step,
 threshold, passed, `init_from`) in the run directory and logs `gate/first_query_accuracy` and
 `gate/passed`. Submitting a run that failed its gate again does nothing (exit status 3). It
 needs a task with queries, so it refuses the induction task. It costs N steps; see the
-two-phase recipe in §6.
+two-phase recipe in §6. **`--gate_enforce false`** only records the gate (`gate.json` with
+`"enforced": false`, `gate/passed`) and never stops the run, to calibrate the gate step.
 
 **Logged every `log_interval` = 50 steps** (averages over the interval): `train/loss`,
 `train/final_loss` (final answers only), `train/final_accuracy` (role 1, argmax),
@@ -172,8 +173,9 @@ the whole vocabulary (`model/embed_norm_mean`, `model/embed_norm_max`) and over 
 
 **Held-out sets of a training config (`cfg/<name>`):** the `configs` section of
 `configs/eval_suite.json` turns a training config into a fixed set of the same distribution
-(the eval split, so never a sample of the training stream). It holds `cfg/lookup_q16` (1,000
-samples of `diag_lookup_q16.json`); add one entry per training config used. Write only these
+(the eval split, so never a sample of the training stream). It holds `cfg/lookup_q16` and
+`cfg/lookup_long` (1,000 samples each of `diag_lookup_q16.json` and `diag_lookup_long.json`);
+add one entry per training config used. Write only these
 sets with `cli write --suite looped_lm/dataset_generation/configs/eval_suite.json --only cfg/`
 (seconds; the other sets are untouched), and evaluate on them with e.g.
 `--eval_sets cfg/lookup_q16,grid/d1_b1 --eval_samples 1000`.
@@ -363,6 +365,13 @@ text (each such token needs its own special before it), so the 20% target needs 
 specials. `python -m looped_lm.diagnostics.induction CONFIG` prints these statistics and an
 example.
 
+**Long contexts: `induction_long.json`** is the same with lengths 100–1,600 (the graph task's
+train.json spans about 620–1,500 tokens), drawn once per batch (`length_per_batch`), so batches
+carry no padding, as the graph stream draws one edge count per batch. Mean length 842,
+supervised fraction 0.52, after-special share 0.227. Its phase 2 is
+`dataset_generation/configs/diag_lookup_long.json`: depth 1, branching 1, 4 queries, T 5–12,
+192–512 edges (1,058 tokens on average, as train.json), held out as `cfg/lookup_long`.
+
 **Special-swap probe** (`diagnostics/special_swap.py`, no training, CPU). An after-special token
 `t` in a copy of `x s t` can be found by matching the name `x` alone (names are unique) or the
 pair `x s`; only the first transfers to `Q: x ?` against `x > t`. The probe makes phase 1
@@ -399,7 +408,7 @@ first run. A run that passed its gate is unaffected by it.
 ```bash
 python tests/looped_lm/test_model.py      # 8 tests, CPU, under a minute
 python tests/looped_lm/test_mqar.py       # 5 tests
-python tests/looped_lm/test_induction.py  # 7 tests
+python tests/looped_lm/test_induction.py  # 8 tests
 ```
 
 - **Induction:** every supervised token is determined by the context (each earlier occurrence
@@ -415,7 +424,10 @@ python tests/looped_lm/test_induction.py  # 7 tests
   yields to resuming. The gate: a passing gate lets the run finish; a failing one stops at
   the gate step without a checkpoint, writes `gate.json`, logs `gate/passed` 0, is not
   restarted when submitted again, and the command line exits with status 3; a gate step that is
-  not a multiple of `log_interval` or beyond `steps`, or on the induction task, is refused.
+  not a multiple of `log_interval` or beyond `steps`, or on the induction task, is refused;
+  a record-only gate (`gate_enforce false`) is written and logged but the run continues. The
+  long config draws one length per batch (no padding) over 100–1,600 tokens, with the same
+  supervised fraction and after-special share; the short config keeps one length per sample.
 
 - **MQAR:** the layout of every ladder config (pairs, target list, every key queried once with
   its value, filler elsewhere, disjoint halves in `mqar_base`); consecutive configs differ by one
