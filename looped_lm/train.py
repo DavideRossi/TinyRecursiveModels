@@ -9,9 +9,9 @@ directory has ckpt_latest.pt resumes it: the model, the optimizer, the schedule 
 position (batch j of the stream is a pure function of (data_seed, j), so the stream restarts at
 the step); a run started with --init_from takes only the model weights of that checkpoint, with a
 fresh optimizer, schedule and data stream (ignored when resuming). With --gate_step N, the run stops
-at step N (exit status 3, no checkpoint, gate.json in the run directory) unless the first-query
-accuracy of the last log interval is above --gate_first_query (--gate_enforce false: only record
-it). SIGUSR1 or SIGTERM (Slurm's time limit, see slurm/train_looped_lm.sbatch) saves a
+at step N (exit status 3, no checkpoint, gate.json in the run directory) unless the gate metric
+over the last log interval is above --gate_threshold: first-query accuracy, or on the induction
+task the accuracy on supervised tokens (--gate_enforce false: only record it). SIGUSR1 or SIGTERM (Slurm's time limit, see slurm/train_looped_lm.sbatch) saves a
 checkpoint and stops.
 """
 import argparse
@@ -49,8 +49,8 @@ class TrainConfig:
     answer_format: str = ""                          # "": the data config's; otherwise overrides it
     allow_small_pool: bool = False                   # diagnostics only: train on a config with pool_size < 2048
     init_from: str = ""                              # checkpoint (ckpt_latest.pt or model_step_N.pt): its model weights only
-    gate_step: int = 0                               # 0: off; else stop at this step unless first-query accuracy passes
-    gate_first_query: float = 0.9                    # the gate: train/first_query_accuracy above this at gate_step
+    gate_step: int = 0                               # 0: off; else stop at this step unless the gate metric passes
+    gate_threshold: float = 0.9                      # the gate: gate_metric(task) above this at gate_step
     gate_enforce: bool = True                        # false: record the gate (gate.json, gate/passed) but never stop
     batch_size: int = 64
     steps: int = 50000
@@ -197,6 +197,12 @@ def init_weights(model: LoopedLM, path: str, model_cfg: ModelConfig, device) -> 
     model.load_state_dict(saved["model"])
 
 
+def gate_metric(task) -> str:
+    """What the gate measures: train/first_query_accuracy, or on the induction task (no queries)
+    train/final_accuracy, the accuracy on supervised tokens."""
+    return "final_accuracy" if isinstance(task, InductionConfig) else "first_query_accuracy"
+
+
 def train(cfg: TrainConfig, model_cfg: ModelConfig, task: Optional[TaskConfig] = None,
           stop_after: Optional[int] = None, record_losses: bool = False) -> dict:
     """Train (or resume) a run. stop_after: stop with a checkpoint once this step is reached, as if
@@ -207,15 +213,14 @@ def train(cfg: TrainConfig, model_cfg: ModelConfig, task: Optional[TaskConfig] =
         if cfg.gate_step % cfg.log_interval or cfg.gate_step > cfg.steps:
             raise ValueError(f"gate_step {cfg.gate_step} must be a multiple of log_interval {cfg.log_interval} "
                              f"and at most steps {cfg.steps}")
-        if isinstance(task, InductionConfig):
-            raise ValueError("the gate needs first queries; the induction task has none")
     gate_path = os.path.join(cfg.run_dir, "gate.json")
     if cfg.gate_step and not cfg.benchmark and os.path.exists(gate_path):
         with open(gate_path) as f:
             gate = json.load(f)
         if not gate["passed"] and gate.get("enforced", True):
-            print(f"{cfg.run_dir}: failed its gate at step {gate['step']} (first-query accuracy "
-                  f"{gate['first_query_accuracy']:.3f}); not restarting it", flush=True)
+            metric = gate.get("metric", "first_query_accuracy")
+            print(f"{cfg.run_dir}: failed its gate at step {gate['step']} ({metric} "
+                  f"{gate[metric]:.3f}); not restarting it", flush=True)
             return {"step": gate["step"], "losses": [], "gate_failed": True}
     device = torch.device(("cuda" if torch.cuda.is_available() else "cpu") if cfg.device == "auto" else cfg.device)
     amp = device.type == "cuda"
@@ -333,13 +338,15 @@ def train(cfg: TrainConfig, model_cfg: ModelConfig, task: Optional[TaskConfig] =
                 a = {k: float(v) for k, v in acc.items()}
                 dt = time.time() - t_last
                 if cfg.gate_step and step == cfg.gate_step:
-                    fq = a["first_correct"] / max(1, a["first_n"])
-                    gate = {"step": step, "first_query_accuracy": fq, "threshold": cfg.gate_first_query,
-                            "passed": fq > cfg.gate_first_query, "enforced": cfg.gate_enforce,
+                    metric = gate_metric(task)
+                    value = (a["final_correct"] / max(1, a["final_n"]) if metric == "final_accuracy"
+                             else a["first_correct"] / max(1, a["first_n"]))
+                    gate = {"step": step, "metric": metric, metric: value, "threshold": cfg.gate_threshold,
+                            "passed": value > cfg.gate_threshold, "enforced": cfg.gate_enforce,
                             "init_from": cfg.init_from}
                     with open(gate_path, "w") as f:
                         json.dump(gate, f, indent=1)
-                    logger.log({"gate/first_query_accuracy": fq, "gate/passed": int(gate["passed"])}, step=step)
+                    logger.log({f"gate/{metric}": value, "gate/passed": int(gate["passed"])}, step=step)
                     gate_failed = cfg.gate_enforce and not gate["passed"]
                 logger.log({"train/loss": a["loss_sum"] / max(1, a["loss_tokens"]),
                             "train/final_loss": a["final_loss_sum"] / max(1, a["final_n"]),
@@ -357,8 +364,8 @@ def train(cfg: TrainConfig, model_cfg: ModelConfig, task: Optional[TaskConfig] =
                             "train/step_time": dt / a["steps"], "train/data_wait": data_wait / a["steps"]}, step=step)
                 acc, t_last, data_wait = None, time.time(), 0.0
             if gate_failed:
-                print(f"gate failed at step {step}: first-query accuracy {gate['first_query_accuracy']:.3f}, "
-                      f"not above {cfg.gate_first_query}; stopping without a checkpoint", flush=True)
+                print(f"gate failed at step {step}: {gate['metric']} {gate[gate['metric']]:.3f}, "
+                      f"not above {cfg.gate_threshold}; stopping without a checkpoint", flush=True)
                 break
             if cfg.eval_interval > 0 and (step % cfg.eval_interval == 0 or step == cfg.steps):  # norms even without sets
                 logger.log(run_eval(), step=step)

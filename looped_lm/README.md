@@ -137,15 +137,16 @@ included) and the data stream start fresh. The model configs must agree, or the 
 start. A run directory that already has `ckpt_latest.pt` resumes from it and ignores
 `init_from`, so a requeued job continues its own run. `init_from` is saved in `config.json`.
 
-**`--gate_step N --gate_first_query 0.9`** (off by default): at step N (a multiple of
-`log_interval`), the run continues only if `train/first_query_accuracy` over the last log
-interval is above the threshold. Otherwise it stops there, without a checkpoint, and exits with
-status 3, so a Slurm job ends as FAILED. Either way it writes `gate.json` (step, accuracy,
-threshold, passed, `init_from`) in the run directory and logs `gate/first_query_accuracy` and
-`gate/passed`. Submitting a run that failed its gate again does nothing (exit status 3). It
-needs a task with queries, so it refuses the induction task. It costs N steps; see the
-two-phase recipe in §6. **`--gate_enforce false`** only records the gate (`gate.json` with
-`"enforced": false`, `gate/passed`) and never stops the run, to calibrate the gate step.
+**`--gate_step N --gate_threshold 0.9`** (off by default): at step N (a multiple of
+`log_interval`), the run continues only if the gate metric over the last log interval is above
+the threshold. The metric is `train/first_query_accuracy`, or on the induction task (no
+queries) `train/final_accuracy`, the accuracy on supervised tokens. Otherwise the run stops
+there, without a checkpoint, and exits with status 3, so a Slurm job ends as FAILED. Either way
+it writes `gate.json` (step, metric and its value, threshold, passed, `init_from`) in the run
+directory and logs `gate/<metric>` and `gate/passed`. Submitting a run that failed its gate
+again does nothing (exit status 3). It costs N steps; see the two-phase recipe in §6.
+**`--gate_enforce false`** only records the gate (`gate.json` with `"enforced": false`,
+`gate/passed`) and never stops the run, to calibrate the gate step.
 
 **Logged every `log_interval` = 50 steps** (averages over the interval): `train/loss`,
 `train/final_loss` (final answers only), `train/final_accuracy` (role 1, argmax),
@@ -389,23 +390,37 @@ python -m looped_lm.diagnostics.special_swap checkpoints/looped_lm/RUN/model_ste
 `--references` also scores the two symbolic matchers: matching the name gives 1.0 on both,
 matching the pair gives 0.0 swapped and 1.0 unswapped.
 
-**Recipe, with the gate.** Phase 2 from a phase 1 checkpoint sometimes fails although phase 1
-converged: in the first lookup round, 1 of 6 checkpoints (L2, seed 2) failed with all 4 data
-seeds, while the other 5 reached first-query accuracy 0.9 by step 100–150 with every data seed.
-The outcome is a property of the checkpoint, not of the data order, and the special-swap probe
-does not predict it. So phase 2 runs with `--gate_step 500`: if first-query accuracy is not above
-0.9 by step 500, the checkpoint is discarded and phase 2 starts from the next phase 1 seed.
-With Slurm the fallback can be chained, as the gate's exit status fails the job:
+**Recipe, with the gates.** Either phase can fail for a seed, and each has a gate that stops
+a failing run early (`--gate_step`, `--gate_threshold`, §2).
+
+- **Phase 2: step 500, threshold 0.5 on first-query accuracy.** Phase 2 from a phase 1
+  checkpoint sometimes fails although phase 1 converged: in the first lookup round, 1 of 6
+  checkpoints (L2, seed 2) failed with all 4 data seeds, staying at chance (first-query
+  accuracy 0.04–0.06) for 10,000 steps, while the other 5 reached 0.9 by step 100–150 with
+  every data seed. The outcome is a property of the checkpoint, not of the data order, and the
+  special-swap probe does not predict it. On long contexts (`diag_lookup_long`, record-only
+  gate) all 5 checkpoints succeeded, but the slowest (L8, seed 2) was at 0.73 at step 500 and
+  crossed 0.9 only at step 850; the others were above 0.97 at step 500. A threshold of 0.5 at
+  step 500 separates the two cases with a wide margin on both sides.
+- **Phase 1: step 6,000, threshold 0.9 on supervised-token accuracy** (`induction_long.json`,
+  10,000 steps). In the long round, 5 of 6 runs crossed 0.95 by step 3,400–4,800 and were
+  above 0.95 at step 6,000; the sixth (L2, seed 0) was at 0.51 at step 6,000 and stalled at
+  0.56, failing on the longer batches.
+
+A run that fails its gate is discarded, and the next seed is used. With Slurm the fallback can
+be chained, as the gate's exit status fails the job:
 
 ```bash
-P2="--steps 10000 --lr 3e-4 --compile true --gate_step 500 --data_config CONFIG"
-j0=$(RUN_NAME=p2_s0 SEED=0 sbatch --parsable slurm/train_looped_lm.sbatch $P2 --init_from P1_s0/model_step_5000.pt)
+P2="--steps 10000 --lr 3e-4 --compile true --gate_step 500 --gate_threshold 0.5 --data_config CONFIG"
+j0=$(RUN_NAME=p2_s0 SEED=0 sbatch --parsable slurm/train_looped_lm.sbatch $P2 --init_from P1_s0/model_step_10000.pt)
 j1=$(RUN_NAME=p2_s1 SEED=1 sbatch --parsable --dependency=afternotok:$j0 slurm/train_looped_lm.sbatch $P2 \
-     --init_from P1_s1/model_step_5000.pt)
+     --init_from P1_s1/model_step_10000.pt)
 ```
 
-`afternotok` also starts the fallback after a crash or a time-out, so check `gate.json` of the
-first run. A run that passed its gate is unaffected by it.
+Phase 1 is chained the same way with `--gate_step 6000 --gate_threshold 0.9`, and its phase 2
+with `--dependency=afterok` on it. `afternotok` also starts the fallback after a crash or a
+time-out, so check `gate.json` of the first run. A run that passed its gate is unaffected by
+it.
 
 ## 7. Tests
 
@@ -427,9 +442,10 @@ python tests/looped_lm/test_induction.py  # 8 tests
   changes nothing), starts a fresh optimizer at step 0, refuses another model config, and
   yields to resuming. The gate: a passing gate lets the run finish; a failing one stops at
   the gate step without a checkpoint, writes `gate.json`, logs `gate/passed` 0, is not
-  restarted when submitted again, and the command line exits with status 3; a gate step that is
-  not a multiple of `log_interval` or beyond `steps`, or on the induction task, is refused;
-  a record-only gate (`gate_enforce false`) is written and logged but the run continues. The
+  restarted when submitted again, and the command line exits with status 3; on the induction
+  task the gate measures the supervised-token accuracy (the logged `train/final_accuracy` at
+  the gate step); a gate step that is not a multiple of `log_interval` or beyond `steps` is
+  refused; a record-only gate (`gate_enforce false`) is written and logged but the run continues. The
   long config draws one length per batch (no padding) over 100–1,600 tokens, with the same
   supervised fraction and after-special share; the short config keeps one length per sample.
 
