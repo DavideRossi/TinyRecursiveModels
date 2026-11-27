@@ -11,6 +11,8 @@
   "diag": {"depth": 8, "branchings": [1, 2, 4, 8], "num_targets": [6, 9, 12],
            "num_samples": 1000, "total_edges": null, "overrides": {...}},   # optional, fixed mode
   "mixed": [{"name": "...", "num_samples": 1000, "overrides": {...}}, ...],
+  "configs": [{"name": "...", "config": "train.json", "num_samples": 1000,   # optional
+               "overrides": {...}}, ...],
   "readable_samples": 5
 }
 
@@ -30,9 +32,15 @@ is skipped with a warning.
 diag/bB_tT (fixed mode): d fixed, one query, every branching crossed with every T, cells with
 T < b omitted, one edge count for all (null: the smallest that fits every cell).
 
+cfg/<name>: held-out samples of a training config (a TaskConfig JSON, its path relative to the
+suite file), with optional overrides; `base` does not apply. The "eval" split never shares
+samples with the training stream ("train" split), so the set measures the training distribution
+on fixed samples.
+
 Each set has its own seed stream (from its name), in the "eval" split.
 """
 import json
+import os
 import warnings
 from typing import List, NamedTuple
 
@@ -116,6 +124,14 @@ def expand(suite: dict) -> List[SetSpec]:
         name = "mixed/" + m["name"]
         cfg = TaskConfig.from_dict(dict(base, **m.get("overrides", {}), name=name))
         out.append(SetSpec(name, cfg, int(m["num_samples"]), seed, stream_id(name)))
+    for c in suite.get("configs", []):
+        name = "cfg/" + c["name"]
+        d = c["config"]
+        if isinstance(d, str):
+            with open(d) as f:
+                d = json.load(f)
+        cfg = TaskConfig.from_dict(dict(d, **c.get("overrides", {}), name=name))
+        out.append(SetSpec(name, cfg, int(c["num_samples"]), seed, stream_id(name)))
     names = [s.name for s in out]
     if len(set(names)) != len(names):
         raise ValueError("duplicate set names in the suite")
@@ -123,5 +139,12 @@ def expand(suite: dict) -> List[SetSpec]:
 
 
 def load(path: str) -> dict:
+    """The suite JSON, with the config files of the "configs" section read (paths relative to the
+    suite file)."""
     with open(path) as f:
-        return json.load(f)
+        suite = json.load(f)
+    for c in suite.get("configs", []):
+        if isinstance(c.get("config"), str):
+            with open(os.path.join(os.path.dirname(os.path.abspath(path)), c["config"])) as f:
+                c["config"] = json.load(f)
+    return suite

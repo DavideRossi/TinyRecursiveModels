@@ -273,6 +273,30 @@ def test_suite_expansion():
             check_sample(sm, "path")
 
 
+def test_suite_configs_section():
+    """cfg/<name>: held-out samples of a training config file (path relative to the suite), in the
+    eval split, never the training stream's."""
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "lookup.json"), "w") as f:
+            json.dump({"name": "lookup", "depth": 1, "branching": 1, "num_queries": 2, "targets_mode": "fixed",
+                        "num_targets": 5, "total_edges": {"range": [10, 20]}}, f)
+        with open(os.path.join(d, "suite.json"), "w") as f:
+            json.dump({"seed": 1, "base": {"num_queries": 3},
+                        "configs": [{"name": "lookup", "config": "lookup.json", "num_samples": 7},
+                                    {"name": "lookup_e30", "config": "lookup.json", "num_samples": 3,
+                                     "overrides": {"total_edges": 30}}]}, f)
+        specs = suite.expand(suite.load(os.path.join(d, "suite.json")))
+    assert [x.name for x in specs] == ["cfg/lookup", "cfg/lookup_e30"]
+    a, b = specs
+    assert a.config.num_queries.max == 2 and a.num_samples == 7     # the file's fields; base does not apply
+    assert b.config.total_edges.min == b.config.total_edges.max == 30 and a.stream != b.stream
+    for i in range(5):
+        ev = make_sample(a.config, a.seed, i, "eval", a.stream)
+        check_sample(ev, "direct")
+        tr = make_sample(a.config, a.seed, i, "train", 0)
+        assert not np.array_equal(ev.tokens, tr.tokens)
+
+
 def test_audit_at_chance_and_detects_a_planted_shortcut():
     cfg = TaskConfig(depth=3, branching=3, num_queries=1, num_distractors=5, total_edges=54)
     r = audit_mod.audit(cfg, 600)

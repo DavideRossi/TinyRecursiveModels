@@ -137,6 +137,15 @@ included) and the data stream start fresh. The model configs must agree, or the 
 start. A run directory that already has `ckpt_latest.pt` resumes from it and ignores
 `init_from`, so a requeued job continues its own run. `init_from` is saved in `config.json`.
 
+**`--gate_step N --gate_first_query 0.9`** (off by default): at step N (a multiple of
+`log_interval`), the run continues only if `train/first_query_accuracy` over the last log
+interval is above the threshold. Otherwise it stops there, without a checkpoint, and exits with
+status 3, so a Slurm job ends as FAILED. Either way it writes `gate.json` (step, accuracy,
+threshold, passed, `init_from`) in the run directory and logs `gate/first_query_accuracy` and
+`gate/passed`. Submitting a run that failed its gate again does nothing (exit status 3). It
+needs a task with queries, so it refuses the induction task. It costs N steps; see the
+two-phase recipe in §6.
+
 **Logged every `log_interval` = 50 steps** (averages over the interval): `train/loss`,
 `train/final_loss` (final answers only), `train/final_accuracy` (role 1, argmax),
 `train/first_query_accuracy` (the final answers of each sample's first query only: with
@@ -160,6 +169,14 @@ moves first. The run fails at start if a set is missing (write the suite first, 
 and at every evaluation it also logs the mean and maximum L2 norm of the embedding rows, over
 the whole vocabulary (`model/embed_norm_mean`, `model/embed_norm_max`) and over the node names
 (`model/embed_norm_names_mean`, `model/embed_norm_names_max`), to follow the logit scale (§1).
+
+**Held-out sets of a training config (`cfg/<name>`):** the `configs` section of
+`configs/eval_suite.json` turns a training config into a fixed set of the same distribution
+(the eval split, so never a sample of the training stream). It holds `cfg/lookup_q16` (1,000
+samples of `diag_lookup_q16.json`); add one entry per training config used. Write only these
+sets with `cli write --suite looped_lm/dataset_generation/configs/eval_suite.json --only cfg/`
+(seconds; the other sets are untouched), and evaluate on them with e.g.
+`--eval_sets cfg/lookup_q16,grid/d1_b1 --eval_samples 1000`.
 
 **Benchmark mode** (`--benchmark true --steps 300`): no evaluation, logs or checkpoints; prints
 one JSON line with the median step time (after 30 untimed steps), the median data wait and the
@@ -359,12 +376,30 @@ python -m looped_lm.diagnostics.special_swap checkpoints/looped_lm/RUN/model_ste
 `--references` also scores the two symbolic matchers: matching the name gives 1.0 on both,
 matching the pair gives 0.0 swapped and 1.0 unswapped.
 
+**Recipe, with the gate.** Phase 2 from a phase 1 checkpoint sometimes fails although phase 1
+converged: in the first lookup round, 1 of 6 checkpoints (L2, seed 2) failed with all 4 data
+seeds, while the other 5 reached first-query accuracy 0.9 by step 100–150 with every data seed.
+The outcome is a property of the checkpoint, not of the data order, and the special-swap probe
+does not predict it. So phase 2 runs with `--gate_step 500`: if first-query accuracy is not above
+0.9 by step 500, the checkpoint is discarded and phase 2 starts from the next phase 1 seed.
+With Slurm the fallback can be chained, as the gate's exit status fails the job:
+
+```bash
+P2="--steps 10000 --lr 3e-4 --compile true --gate_step 500 --data_config CONFIG"
+j0=$(RUN_NAME=p2_s0 SEED=0 sbatch --parsable slurm/train_looped_lm.sbatch $P2 --init_from P1_s0/model_step_5000.pt)
+j1=$(RUN_NAME=p2_s1 SEED=1 sbatch --parsable --dependency=afternotok:$j0 slurm/train_looped_lm.sbatch $P2 \
+     --init_from P1_s1/model_step_5000.pt)
+```
+
+`afternotok` also starts the fallback after a crash or a time-out, so check `gate.json` of the
+first run. A run that passed its gate is unaffected by it.
+
 ## 7. Tests
 
 ```bash
 python tests/looped_lm/test_model.py      # 8 tests, CPU, under a minute
 python tests/looped_lm/test_mqar.py       # 5 tests
-python tests/looped_lm/test_induction.py  # 6 tests
+python tests/looped_lm/test_induction.py  # 7 tests
 ```
 
 - **Induction:** every supervised token is determined by the context (each earlier occurrence
@@ -377,7 +412,10 @@ python tests/looped_lm/test_induction.py  # 6 tests
   oracle stub gets every supervised token right and the after-special / other split adds up; a
   short run logs the split metrics; `--init_from` loads the weights exactly (with lr 0 one step
   changes nothing), starts a fresh optimizer at step 0, refuses another model config, and
-  yields to resuming.
+  yields to resuming. The gate: a passing gate lets the run finish; a failing one stops at
+  the gate step without a checkpoint, writes `gate.json`, logs `gate/passed` 0, is not
+  restarted when submitted again, and the command line exits with status 3; a gate step that is
+  not a multiple of `log_interval` or beyond `steps`, or on the induction task, is refused.
 
 - **MQAR:** the layout of every ladder config (pairs, target list, every key queried once with
   its value, filler elsewhere, disjoint halves in `mqar_base`); consecutive configs differ by one

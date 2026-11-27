@@ -8,7 +8,9 @@ resuming) and model_step_N.pt (weights only, every keep_interval steps). Startin
 directory has ckpt_latest.pt resumes it: the model, the optimizer, the schedule step and the data
 position (batch j of the stream is a pure function of (data_seed, j), so the stream restarts at
 the step); a run started with --init_from takes only the model weights of that checkpoint, with a
-fresh optimizer, schedule and data stream (ignored when resuming). SIGUSR1 or SIGTERM (Slurm's time limit, see slurm/train_looped_lm.sbatch) saves a
+fresh optimizer, schedule and data stream (ignored when resuming). With --gate_step N, the run stops
+at step N (exit status 3, no checkpoint, gate.json in the run directory) unless the first-query
+accuracy of the last log interval is above --gate_first_query. SIGUSR1 or SIGTERM (Slurm's time limit, see slurm/train_looped_lm.sbatch) saves a
 checkpoint and stops.
 """
 import argparse
@@ -33,6 +35,7 @@ from .evaluation import evaluate_set, load_set
 from .model import LoopedLM, ModelConfig
 from .objective import loss_and_stats, pad_to_multiple, to_device
 
+GATE_FAILED = 3  # exit status of a run stopped by its gate
 DEFAULT_EVAL_SETS = ("grid/d1_b1,grid/d2_b2,grid/d4_b2,grid/d8_b1,grid/d8_b4,grid/d16_b4,"
                      "mixed/q4_in_distribution")
 
@@ -45,6 +48,8 @@ class TrainConfig:
     answer_format: str = ""                          # "": the data config's; otherwise overrides it
     allow_small_pool: bool = False                   # diagnostics only: train on a config with pool_size < 2048
     init_from: str = ""                              # checkpoint (ckpt_latest.pt or model_step_N.pt): its model weights only
+    gate_step: int = 0                               # 0: off; else stop at this step unless first-query accuracy passes
+    gate_first_query: float = 0.9                    # the gate: train/first_query_accuracy above this at gate_step
     batch_size: int = 64
     steps: int = 50000
     lr: float = 1e-3
@@ -193,8 +198,23 @@ def init_weights(model: LoopedLM, path: str, model_cfg: ModelConfig, device) -> 
 def train(cfg: TrainConfig, model_cfg: ModelConfig, task: Optional[TaskConfig] = None,
           stop_after: Optional[int] = None, record_losses: bool = False) -> dict:
     """Train (or resume) a run. stop_after: stop with a checkpoint once this step is reached, as if
-    interrupted (tests). Returns {"step", "losses" (per step, with record_losses), "benchmark"}."""
+    interrupted (tests). Returns {"step", "losses" (per step, with record_losses), "benchmark",
+    "gate_failed"}."""
     task = task if task is not None else load_task(cfg)
+    if cfg.gate_step:
+        if cfg.gate_step % cfg.log_interval or cfg.gate_step > cfg.steps:
+            raise ValueError(f"gate_step {cfg.gate_step} must be a multiple of log_interval {cfg.log_interval} "
+                             f"and at most steps {cfg.steps}")
+        if isinstance(task, InductionConfig):
+            raise ValueError("the gate needs first queries; the induction task has none")
+    gate_path = os.path.join(cfg.run_dir, "gate.json")
+    if cfg.gate_step and not cfg.benchmark and os.path.exists(gate_path):
+        with open(gate_path) as f:
+            gate = json.load(f)
+        if not gate["passed"]:
+            print(f"{cfg.run_dir}: failed its gate at step {gate['step']} (first-query accuracy "
+                  f"{gate['first_query_accuracy']:.3f}); not restarting it", flush=True)
+            return {"step": gate["step"], "losses": [], "gate_failed": True}
     device = torch.device(("cuda" if torch.cuda.is_available() else "cpu") if cfg.device == "auto" else cfg.device)
     amp = device.type == "cuda"
     bench = cfg.benchmark
@@ -274,7 +294,7 @@ def train(cfg: TrainConfig, model_cfg: ModelConfig, task: Optional[TaskConfig] =
         return out
 
     losses: List[float] = []
-    acc = None
+    acc, gate_failed = None, False
     t_last, data_wait, step_times, waits = time.time(), 0.0, [], []
     it = iter(loader)
     model.train()
@@ -310,6 +330,14 @@ def train(cfg: TrainConfig, model_cfg: ModelConfig, task: Optional[TaskConfig] =
             if step % cfg.log_interval == 0 or step == cfg.steps:
                 a = {k: float(v) for k, v in acc.items()}
                 dt = time.time() - t_last
+                if cfg.gate_step and step == cfg.gate_step:
+                    fq = a["first_correct"] / max(1, a["first_n"])
+                    gate = {"step": step, "first_query_accuracy": fq, "threshold": cfg.gate_first_query,
+                            "passed": fq > cfg.gate_first_query, "init_from": cfg.init_from}
+                    with open(gate_path, "w") as f:
+                        json.dump(gate, f, indent=1)
+                    logger.log({"gate/first_query_accuracy": fq, "gate/passed": int(gate["passed"])}, step=step)
+                    gate_failed = not gate["passed"]
                 logger.log({"train/loss": a["loss_sum"] / max(1, a["loss_tokens"]),
                             "train/final_loss": a["final_loss_sum"] / max(1, a["final_n"]),
                             "train/final_accuracy": a["final_correct"] / max(1, a["final_n"]),
@@ -325,6 +353,10 @@ def train(cfg: TrainConfig, model_cfg: ModelConfig, task: Optional[TaskConfig] =
                             "train/tokens_per_s": a["real_tokens"] / dt, "train/padded_tokens_per_s": a["padded_tokens"] / dt,
                             "train/step_time": dt / a["steps"], "train/data_wait": data_wait / a["steps"]}, step=step)
                 acc, t_last, data_wait = None, time.time(), 0.0
+            if gate_failed:
+                print(f"gate failed at step {step}: first-query accuracy {gate['first_query_accuracy']:.3f}, "
+                      f"not above {cfg.gate_first_query}; stopping without a checkpoint", flush=True)
+                break
             if cfg.eval_interval > 0 and (step % cfg.eval_interval == 0 or step == cfg.steps):  # norms even without sets
                 logger.log(run_eval(), step=step)
                 t_last = time.time()
@@ -342,7 +374,7 @@ def train(cfg: TrainConfig, model_cfg: ModelConfig, task: Optional[TaskConfig] =
             signal.signal(s, h)
         if logger is not None:
             logger.finish()
-    result = {"step": step, "losses": losses}
+    result = {"step": step, "losses": losses, "gate_failed": gate_failed}
     if bench:
         skip = min(30, len(step_times) // 3)
         st, wt = step_times[skip:], waits[skip:]
@@ -384,7 +416,8 @@ def main(argv=None):
     cfg, model_cfg = parse_args(argv)
     if cfg.benchmark:
         cfg = dataclasses.replace(cfg, eval_interval=0)
-    train(cfg, model_cfg)
+    if train(cfg, model_cfg).get("gate_failed"):
+        return GATE_FAILED
 
 
 if __name__ == "__main__":

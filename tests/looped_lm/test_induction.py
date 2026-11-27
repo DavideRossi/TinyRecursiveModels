@@ -193,6 +193,49 @@ def test_training_and_init_from():
         assert int(torch.load(os.path.join(d, "p2", "ckpt_latest.pt"), weights_only=False)["step"]) == 3
 
 
+def test_gate():
+    """--gate_step: a failing gate stops the run at that step without a checkpoint, writes
+    gate.json, exits with status 3 and is not restarted; a passing gate lets the run finish."""
+    from looped_lm.train import GATE_FAILED, main
+    with tempfile.TemporaryDirectory() as d:
+        ok = _cfg(d, "ok", LOOKUP, steps=6, gate_step=4, gate_first_query=-1.0)
+        out = train(ok, ModelConfig(**TINY))
+        assert out["step"] == 6 and not out["gate_failed"]
+        gate = json.load(open(os.path.join(d, "ok", "gate.json")))
+        assert gate["passed"] and gate["step"] == 4
+
+        bad = _cfg(d, "bad", LOOKUP, steps=6, gate_step=4, gate_first_query=1.0)  # accuracy is never above 1
+        out = train(bad, ModelConfig(**TINY))
+        assert out["step"] == 4 and out["gate_failed"]
+        assert not os.path.exists(os.path.join(d, "bad", "ckpt_latest.pt"))
+        gate = json.load(open(os.path.join(d, "bad", "gate.json")))
+        assert not gate["passed"] and gate["step"] == 4 and 0.0 <= gate["first_query_accuracy"] <= 1.0
+        rows = [json.loads(l) for l in open(os.path.join(d, "bad", "metrics.jsonl"))]
+        assert [r["gate/passed"] for r in rows if "gate/passed" in r] == [0]
+        assert max(r["step"] for r in rows) == 4
+        # Submitting it again does not restart it, and the command line exits with status 3
+        argv = ["--run_name", "bad", "--out_dir", d, "--data_config", LOOKUP, "--steps", "6", "--gate_step", "4",
+                "--gate_first_query", "1.0", "--log_interval", "2", "--eval_interval", "0", "--num_workers", "0",
+                "--wandb", "off", "--device", "cpu", "--width", "32", "--num_heads", "2", "--head_dim", "16",
+                "--mlp_hidden", "64", "--core_layers", "1", "--batch_size", "4"]
+        assert main(argv) == GATE_FAILED
+        assert max(json.loads(l)["step"] for l in open(os.path.join(d, "bad", "metrics.jsonl"))) == 4
+
+        for kw in (dict(gate_step=3), dict(gate_step=8)):  # not a multiple of log_interval 2; beyond steps
+            try:
+                train(_cfg(d, "x", LOOKUP, steps=6, **kw), ModelConfig(**TINY))
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(kw)
+        try:
+            train(_cfg(d, "y", CONFIG, gate_step=2), ModelConfig(**TINY))
+        except ValueError as e:
+            assert "first queries" in str(e)
+        else:
+            raise AssertionError("the gate must be refused on the induction task")
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for t in tests:

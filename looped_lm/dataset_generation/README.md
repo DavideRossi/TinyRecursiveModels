@@ -494,6 +494,7 @@ A suite JSON describes every fixed set, as in `configs/eval_suite.json`:
            {"name": "q4_deep", "num_samples": 2000,
             "overrides": {"depth": {"range": [9, 16]}, "branching": {"range": [1, 4]},
                           "num_queries": 4, "total_edges": 512}}],
+ "configs": [{"name": "lookup_q16", "config": "diag_lookup_q16.json", "num_samples": 1000}],
  "readable_samples": 5
 }
 ```
@@ -558,8 +559,15 @@ altogether but exceed the training lengths (2,317–2,323 tokens).
 distractors). They never trim: 8 × 32 = 256 and 8 × 64 = 512 edges fit exactly. 798 and 1,566
 tokens.
 
+**Held-out sets of training configs (`cfg/<name>`):** each entry of `configs` names a TaskConfig
+JSON (path relative to the suite file) and optional `overrides`; `base` does not apply. The set
+has the training config's distribution, from the eval split, so it never contains a sample of
+the training stream: a fixed measure of the training distribution. `cfg/lookup_q16`: 1,000
+samples, 246 tokens on average.
+
 **Skipping sections:** `write`, `stats` and `audit` take `--skip companion/ diag/` (any name
-prefixes) to leave sets out; `--only` selects instead.
+prefixes) to leave sets out; `--only` selects instead (`write --only cfg/` writes only the
+held-out sets, leaving the others on disk as they are).
 
 **The answer format** belongs to the suite: write one suite per format you train with, e.g.
 a copy `eval_suite_dfs.json` with `"answer_format": "dfs"`, which `write` puts in
@@ -829,7 +837,7 @@ Measured in `fixed` mode, 2,000 samples per set.
 
 ```bash
 python tests/looped_lm/test_checker.py      # the checker on hand-written graphs (18 tests)
-python tests/looped_lm/test_generator.py    # generator, datasets, storage, suites, audit (26 tests)
+python tests/looped_lm/test_generator.py    # generator, datasets, storage, suites, audit (29 tests)
 ```
 
 `tests/looped_lm/per_component_reference.json` holds fingerprints of `per_component` samples

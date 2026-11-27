@@ -163,10 +163,11 @@ def cmd_audit(args):
 
 def cmd_write(args):
     suite = suite_mod.load(args.suite)
-    specs = _specs(args.suite, None, args.skip)
+    specs = _specs(args.suite, args.only, args.skip)
     if args.out is None:
         args.out = os.path.join(DATA_DIR, os.path.splitext(os.path.basename(args.suite))[0])
-    print(f"writing to {args.out}" + (f" (skipping {', '.join(args.skip)})" if args.skip else ""))
+    print(f"writing to {args.out}" + (f" (only {', '.join(args.only)})" if args.only else "")
+          + (f" (skipping {', '.join(args.skip)})" if args.skip else ""))
     os.makedirs(args.out, exist_ok=True)
     VOCAB.save(os.path.join(args.out, "vocab.json"))
     shutil.copy(args.suite, os.path.join(args.out, "suite.json"))
@@ -254,6 +255,7 @@ def main(argv=None):
     sp.add_argument("--out", help="output directory (default: looped_lm/data/<suite file name without .json>)")
     sp.add_argument("--num", type=int, help="samples per set (overrides the suite)")
     sp.add_argument("--check", action="store_true", help="run the checker on every written sample")
+    sp.add_argument("--only", nargs="+", help="only the sets whose name starts with one of these, e.g. cfg/")
     sp.add_argument("--skip", nargs="+", help="leave out the sets whose name starts with one of these, "
                     "e.g. companion/ diag/")
     sp.set_defaults(func=cmd_write)
