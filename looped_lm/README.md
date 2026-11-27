@@ -346,17 +346,32 @@ text (each such token needs its own special before it), so the 20% target needs 
 specials. `python -m looped_lm.diagnostics.induction CONFIG` prints these statistics and an
 example.
 
+**Special-swap probe** (`diagnostics/special_swap.py`, no training, CPU). An after-special token
+`t` in a copy of `x s t` can be found by matching the name `x` alone (names are unique) or the
+pair `x s`; only the first transfers to `Q: x ?` against `x > t`. The probe makes phase 1
+samples, replaces each special of every repeat by another special (never one already seen at
+that place of the segment), and scores the token after it, against the same positions unswapped:
+
+```bash
+python -m looped_lm.diagnostics.special_swap checkpoints/looped_lm/RUN/model_step_5000.pt [...] [--references]
+```
+
+`--references` also scores the two symbolic matchers: matching the name gives 1.0 on both,
+matching the pair gives 0.0 swapped and 1.0 unswapped.
+
 ## 7. Tests
 
 ```bash
 python tests/looped_lm/test_model.py      # 8 tests, CPU, under a minute
 python tests/looped_lm/test_mqar.py       # 5 tests
-python tests/looped_lm/test_induction.py  # 5 tests
+python tests/looped_lm/test_induction.py  # 6 tests
 ```
 
 - **Induction:** every supervised token is determined by the context (each earlier occurrence
   of its one or two preceding tokens, ending in a name, is followed by it); never two specials in
-  a row; the first token of a repeat is unsupervised; names outside repeats are unique;
+  a row; the first token of a repeat is unsupervised; names outside repeats are unique; `segment`
+  and `offset` identify the copied token; the special-swap probe gives 1.0 / 0.0 for the two
+  symbolic matchers;
   `after_special` marks exactly the supervised tokens after a special; the supervised fraction
   and after-special share are in range; the stream is deterministic and worker-independent; the
   oracle stub gets every supervised token right and the after-special / other split adds up; a

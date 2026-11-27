@@ -104,24 +104,26 @@ def make_sample(cfg: InductionConfig, rng: np.random.Generator) -> dict:
     length = int(rng.integers(cfg.min_len, cfg.max_len + 1))
     perm = rng.permutation(NODE_POOL)
     names = iter(VOCAB.node(int(i)) for i in perm)
-    toks, sup = [BOS], [False]
+    toks, sup, seg_id, offset = [BOS], [False], [-1], [-1]
     fresh = []  # the fresh segments so far
     while len(toks) < length:
         if fresh and rng.random() < cfg.repeat_prob:
-            src = fresh[int(rng.integers(len(fresh)))]
+            k = int(rng.integers(len(fresh)))
+            src = fresh[k]
+            a = 0
             if rng.random() < cfg.fragment_prob:
                 starts = [i for i in range(len(src) - cfg.min_fragment + 1) if VOCAB.is_node(src[i])]
                 a = starts[int(rng.integers(len(starts)))]
-                seg = src[a:]
-            else:
-                seg = list(src)
-            toks += seg
+            seg = src[a:]
             sup += [False] + [True] * (len(seg) - 1)
         else:
+            k, a = len(fresh), 0
             seg = _fresh_segment(cfg, rng, names)
             fresh.append(seg)
-            toks += seg
             sup += [False] * len(seg)
+        toks += seg
+        seg_id += [k] * len(seg)
+        offset += list(range(a, a + len(seg)))
     tokens = np.array(toks[:length], dtype=np.int64)
     loss_mask = np.array(sup[:length], dtype=bool)
     role = np.where(loss_mask, ROLE_FINAL, 0).astype(np.int64)
@@ -131,7 +133,9 @@ def make_sample(cfg: InductionConfig, rng: np.random.Generator) -> dict:
     zeros = np.zeros(length, dtype=np.int64)
     return {"tokens": tokens, "loss_mask": loss_mask, "role": role, "pred_pos": pred_pos,
             "query_index": np.full(length, -1, dtype=np.int64), "depth": zeros, "branching": zeros.copy(),
-            "after_special": after_special}
+            "after_special": after_special,
+            # which fresh-segment token each token is (or copies): segment number and offset (-1: <bos>)
+            "segment": np.array(seg_id[:length], dtype=np.int64), "offset": np.array(offset[:length], dtype=np.int64)}
 
 
 def collate(samples: list) -> dict:

@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from looped_lm.dataset_generation.vocab import BOS, PAD, VOCAB  # noqa: E402
 from looped_lm.diagnostics.induction import (InductionConfig, InductionStream, describe, make_batch,  # noqa: E402
                                              make_sample)
+from looped_lm.diagnostics.special_swap import make_probe, matcher_predictor, score, swap_sample  # noqa: E402
 from looped_lm.model import LoopedLM, ModelConfig  # noqa: E402
 from looped_lm.objective import loss_and_stats  # noqa: E402
 from looped_lm.train import TrainConfig, load_task, train  # noqa: E402
@@ -74,6 +75,27 @@ def test_sample_structure():
                 if int(t[p]) in seen:
                     assert p == len(t) - 1 or m[p + 1], p
                 seen.add(int(t[p]))
+
+
+def test_segment_offset_and_special_swap():
+    """segment/offset identify the copied token; the special-swap probe separates a matcher of the
+    name alone (unaffected) from a matcher of the name and the special (no match after the swap)."""
+    cfg = InductionConfig.load(CONFIG)
+    rng = np.random.default_rng(1)
+    for _ in range(100):
+        s = make_sample(cfg, rng)
+        same = {}
+        for t, g, o in zip(s["tokens"], s["segment"], s["offset"]):
+            assert same.setdefault((int(g), int(o)), int(t)) == int(t)
+        swapped, pos = swap_sample(s, rng)
+        assert ((swapped != s["tokens"]) <= s["loss_mask"]).all()          # only repeat tokens change
+        changed = np.nonzero(swapped != s["tokens"])[0]
+        assert all(VOCAB.first_node > swapped[q] != BOS for q in changed)
+        assert set(pos.tolist()) == {q + 1 for q in changed if q + 1 < len(swapped) and s["loss_mask"][q + 1]}
+    probe = make_probe(cfg, 200)
+    name, pair = score(matcher_predictor(False), probe), score(matcher_predictor(True), probe)
+    assert name["swapped_accuracy"] == name["control_accuracy"] == 1.0 and name["n"] > 1000
+    assert pair["control_accuracy"] == 1.0 and pair["swapped_accuracy"] == 0.0
 
 
 def test_statistics():
