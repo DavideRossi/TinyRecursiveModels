@@ -14,10 +14,12 @@ import torch.nn.functional as F
 
 from .dataset_generation.dataset import collate, to_item
 from .dataset_generation.storage import StoredSet
-from .dataset_generation.vocab import OPEN
+from .dataset_generation.vocab import BACKTRACK, OPEN
 from .objective import ANSWER_ROLES, MAX_DEPTH, ROLE_FINAL, query_exact, to_device
 
-ROLE_INTERMEDIATE = 2
+ROLE_INTERMEDIATE, ROLE_BACKTRACK = 2, 4
+TOKEN_KINDS = ("successor", "backtrack", "branch_start")  # kinds of answer tokens (dfs, path): see score_batch
+KIND_FORMATS = ("dfs", "path")
 
 
 def wilson(k: int, n: int, z: float = 1.959964) -> tuple:
@@ -35,7 +37,10 @@ def score_batch(model, batch: dict) -> Dict[str, np.ndarray]:
     """Per final answer: correct (argmax at pred_pos == answer token), its cross-entropy, exact
     (every answer token of its query correct, objective.query_exact), the query's d and b, its index
     among the sample's queries, and the sample's row in the batch. Answer tokens other than the
-    final one are predicted at their position - 1."""
+    final one are predicted at their position - 1. Also, per answer token (tok_*): correct, its
+    query's index and depth, and its kind (index into TOKEN_KINDS): backtrack (<bt>), branch_start
+    (the answer's first token or the token after <bt>: the next child of the source to try) or
+    successor (every other token, the final answer included: the successor of the token before)."""
     tokens, role = batch["tokens"], batch["role"]
     answer = role == ROLE_FINAL
     for r in ANSWER_ROLES:
@@ -54,11 +59,15 @@ def score_batch(model, batch: dict) -> Dict[str, np.ndarray]:
                                          correct.cpu().numpy())
     fin = final.cpu().numpy()
     level_ok, level_set = level_ok[fin], level_set[fin]
+    starts = ~answer[b, t - 1] | (tokens[b, t - 1] == BACKTRACK)
+    kind = torch.where(role[b, t] == ROLE_BACKTRACK, 1, torch.where(starts, 2, 0))
+    tok = {"tok_kind": kind.cpu().numpy(), "tok_correct": correct.cpu().numpy(),
+           "tok_depth": batch["depth"][b, t].cpu().numpy(), "tok_query_index": batch["query_index"][b, t].cpu().numpy()}
     b, t, logits, target, correct, exact = b[final], t[final], logits[final], target[final], correct[final], exact[final]
     return {"correct": correct.cpu().numpy(), "exact": exact.cpu().numpy(), "level_ok": level_ok, "level_set": level_set,
             "loss": F.cross_entropy(logits, target, reduction="none").cpu().numpy(),
             "depth": batch["depth"][b, t].cpu().numpy(), "branching": batch["branching"][b, t].cpu().numpy(),
-            "query_index": batch["query_index"][b, t].cpu().numpy(), "row": b.cpu().numpy()}
+            "query_index": batch["query_index"][b, t].cpu().numpy(), "row": b.cpu().numpy(), **tok}
 
 
 def bracket_levels(rows, queries, roles, targets, preds, correct):
@@ -133,17 +142,20 @@ def evaluate_set(model, loaded: dict, device, amp: bool = True, by_db: Optional[
     first_query_exact_match_by_depth["d1"], ... (summaries like the others). For answers with
     brackets (frontier), first_query_levels["d<d>"] per depth of the first queries: n, level[k - 1]
     (bracket level k entirely right under teacher forcing), level_set[k - 1] (its nodes right as a
-    set, in any order) and final (the final selection, given the correct brackets)."""
+    set, in any order) and final (the final selection, given the correct brackets). For dfs and
+    path answers, first_query_token_kinds["d<d>"][kind] per depth of the first queries: n and
+    accuracy of the answer tokens of each kind (score_batch: successor, backtrack, branch_start)."""
     was_training = model.training
     model.eval()
+    tok_keys = ("tok_kind", "tok_correct", "tok_depth", "tok_query_index")
     cols = {k: [] for k in ("correct", "exact", "level_ok", "level_set", "loss", "depth", "branching", "query_index",
-                            "chance")}
+                            "chance") + tok_keys}
     for batch in loaded["batches"]:
         dev = to_device(batch, device)
         with torch.autocast(device_type=torch.device(device).type, dtype=torch.bfloat16,
                             enabled=amp and torch.device(device).type == "cuda"):
             s = score_batch(model, dev)
-        for k in ("correct", "exact", "level_ok", "level_set", "loss", "depth", "branching", "query_index"):
+        for k in ("correct", "exact", "level_ok", "level_set", "loss", "depth", "branching", "query_index") + tok_keys:
             cols[k].append(s[k])
         cols["chance"].append(1.0 / batch["num_targets"].numpy()[s["row"]])
     model.train(was_training)
@@ -179,6 +191,16 @@ def evaluate_set(model, loaded: dict, device, amp: bool = True, by_db: Optional[
                 "n": int(m.sum()), "final": float(c["correct"][m].mean()),
                 "level": [float(lv[m, k][lv[m, k] >= 0].mean()) for k in levels],
                 "level_set": [float(ls[m, k][ls[m, k] >= 0].mean()) for k in levels]}
+    if loaded["config"].answer_format in KIND_FORMATS:
+        tf = c["tok_query_index"] == 0
+        out["first_query_token_kinds"] = {}
+        for d in sorted(set(c["tok_depth"][tf].tolist())):
+            entry = {}
+            for i, kind in enumerate(TOKEN_KINDS):
+                m = tf & (c["tok_depth"] == d) & (c["tok_kind"] == i)
+                if m.any():
+                    entry[kind] = {"n": int(m.sum()), "accuracy": float(c["tok_correct"][m].mean())}
+            out["first_query_token_kinds"][f"d{int(d)}"] = entry
     out["num_samples"] = loaded["num_samples"]
     out["tokens_mean"] = loaded["tokens_mean"]
     if by_db is None:

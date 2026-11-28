@@ -366,6 +366,10 @@ def train(cfg: TrainConfig, model_cfg: ModelConfig, task: Optional[TaskConfig] =
                 metric = key[:-len("_by_depth")]
                 out.update({f"eval/{name}/{metric}_{k}": s["accuracy"] for k, s in r.get(key, {}).items()})
             out.update(level_metrics(r, f"eval/{name}/first_query_"))  # bracketed answers (frontier) only
+            kinds = r.get("first_query_token_kinds", {})  # dfs and path answers only
+            for dk, v in kinds.items():
+                pre = f"eval/{name}/first_query_" + ("" if len(kinds) == 1 else f"{dk}_")
+                out.update({f"{pre}{kind}": x["accuracy"] for kind, x in v.items()})
         out.update({f"model/{k}": v for k, v in model.embed_norms().items()})
         return out
 

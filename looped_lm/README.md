@@ -209,7 +209,9 @@ cross-entropy on final answers), `eval/<set>/chance`, `eval/<set>/n`, and
 for sets that mix depths (branchings) `eval/<set>/first_query_accuracy_d<d>` (`_b<b>`), and
 `eval/<set>/exact_match` / `first_query_exact_match` (with `_d<d>` for sets mixing depths), and
 for frontier answers `eval/<set>/first_query_level<k>`, `_level<k>_set` and `_final` (§3; with
-`d<d>_` before `level` for sets mixing depths). **Watch the loss as well
+`d<d>_` before `level` for sets mixing depths), and for dfs and path answers
+`eval/<set>/first_query_successor`, `_backtrack`, `_branch_start` (with `d<d>_` for sets mixing
+depths). **Watch the loss as well
 as the accuracy:** on these tasks accuracy can sit at chance and then jump, and the loss usually
 moves first. The run fails at start if a set is missing (write the suite first, §4). At step 0
 and at every evaluation it also logs the mean and maximum L2 norm of the embedding rows, over
@@ -266,6 +268,13 @@ python -m looped_lm.evaluate --checkpoint checkpoints/looped_lm/RUN/model_step_2
   Answers are d·(b + 2) + 1 tokens plus the end token: 7 at d1 b4, 25 at d4 b4, 49 at d8 b4.
   Samples of train.json are 5% longer than in the direct format (1,112 tokens on average at
   depths 1–8, at most about 1,700).
+- **Token kinds** (dfs and path answers; `first_query_token_kinds` in the JSON, per depth of the
+  first queries). Accuracy of the answer tokens of each kind, under teacher forcing:
+  - `successor`: the successor of the token just written, the final answer included;
+  - `backtrack`: `<bt>` after a dead end (it is a dead end, not a target);
+  - `branch_start`: the answer's first token or the token after `<bt>`, the source's next child
+    in canonical order.
+  dfs answers average 1,060 tokens per train.json sample (at most about 1,630), as the direct format.
 - **Output:** `<run>/eval/<checkpoint>_step<N>.json` (all results, configs and paths) and `.csv`
   (one row per set, plus one per (d, b) with the `depth` and `branching` columns filled), for
   comparing runs in a notebook. `--out` changes the directory.
@@ -545,10 +554,34 @@ RUN_NAME=fr_L8_s0 DEPTH=8 WIDTH=256 SEED=0 sbatch --dependency=afterok:$j slurm/
     --init_from checkpoints/looped_lm/s1_L8_s0/ckpt_latest.pt
 ```
 
+**Result (L8 seeds 0–2, from stage-1 reruns at steps 2,000 / 2,750 / 4,000).**
+- Frontier stage 1 passed in 2 of 3 runs, at steps 8,000 and 9,250. The third never learned
+  level 1 (0.03): it wrote one of the targets at random in the child slots.
+- Stage 2 failed in both runs that reached it, and **the failure is at level 2**. Level 1 was
+  at 0.97 with exact = set, so wrong children, not wrong order; the final selection at 1.00.
+  Level 2 was at 0.27 and 0.04, again exact = set. One run solved level 2 at branching 1 (grid
+  d2_b1 0.99) and not at b4 (0.00); 0.27 is about the share of b1 queries.
+- Node j of level 2 is the successor of node j of level 1, b + 2 tokens back. At b = 1 the
+  offset is fixed; at b > 1 the model has to align positions across brackets. The hypothesis is
+  that this hidden counting step is what fails.
+
+**dfs**, the same curriculum, from the same stage-1 checkpoints:
+
+```bash
+python -m looped_lm.dataset_generation.cli write --suite looped_lm/dataset_generation/configs/eval_suite.json \
+    --answer_format dfs --only grid/ cfg/train --check           # -> looped_lm/data/eval_suite_dfs
+RUN_NAME=dfs_L8_s0 ... --curriculum looped_lm/configs/curriculum_depth.json --answer_format dfs \
+    --eval_suite looped_lm/data/eval_suite_dfs --init_from checkpoints/looped_lm/s1_L8_s0/model_step_N.pt
+```
+
+Each dfs token is the successor of the token just written, a `<bt>` at a dead end (a membership
+check), or the source's next child after the one tried before. None needs counting. The token
+kinds (§3) show which step fails.
+
 ## 7. Tests
 
 ```bash
-python tests/looped_lm/test_model.py       # 11 tests, CPU, under a minute
+python tests/looped_lm/test_model.py       # 12 tests, CPU, under a minute
 python tests/looped_lm/test_curriculum.py  # 7 tests
 python tests/looped_lm/test_mqar.py        # 5 tests
 python tests/looped_lm/test_induction.py   # 8 tests
@@ -609,6 +642,9 @@ python tests/looped_lm/test_induction.py   # 8 tests
   set is right; with a wrong node at level 2, level 2 is wrong, set included; every other level
   and the final selection stay right, and exact match fails for both queries; a clean oracle
   gets every level; the direct format has no levels.
+- **Token kinds (dfs):** token accuracy by kind and depth matches kinds recomputed from the
+  query records, and one error at a `<bt>`, one at a branch start and one at a successor each
+  lower their own kind only; direct and frontier answers have no kinds.
 - **Evaluation:** with an oracle stub whose hidden state at position p encodes the token at
   p + 1, every answer is correct, chance and the Wilson interval are right, and the (d, b)
   breakdown adds up; the first-query results by depth and by branching count each value's first

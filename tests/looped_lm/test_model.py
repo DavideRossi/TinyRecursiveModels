@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from looped_lm.dataset_generation.config import TaskConfig  # noqa: E402
 from looped_lm.dataset_generation.dataset import collate, to_item  # noqa: E402
 from looped_lm.dataset_generation.generate import make_sample  # noqa: E402
-from looped_lm.dataset_generation.vocab import CLOSE, OPEN, PAD, VOCAB  # noqa: E402
+from looped_lm.dataset_generation.vocab import BACKTRACK, CLOSE, OPEN, PAD, VOCAB  # noqa: E402
 from looped_lm.evaluation import evaluate_set, wilson  # noqa: E402
 from looped_lm.model import LoopedLM, ModelConfig  # noqa: E402
 from looped_lm.objective import loss_and_stats  # noqa: E402
@@ -301,6 +301,48 @@ def test_frontier_levels():
     clean = evaluate_set(NextTokenOracle(offset=1), data, "cpu")["first_query_levels"]
     assert all(x == 1.0 for v in clean.values() for x in v["level"] + v["level_set"])
     assert "first_query_levels" not in evaluate_set(NextTokenOracle(offset=1), loaded(MULTI, 4), "cpu")
+
+
+def test_dfs_token_kinds():
+    """dfs answers: token accuracy by kind (successor, backtrack, branch_start) per depth of the first
+    queries, against kinds recomputed from the query records; an error at one token of each kind
+    lowers that kind only. Direct and frontier answers have no kinds."""
+    dfs = MULTI.replace(answer_format="dfs", branching=2)
+    data = loaded(dfs, 12)
+    batch = data["batches"][0]
+    tok = batch["tokens"]
+    q0 = [qs[0] for qs in batch["queries"]]
+    kinds = {}  # (row, position) -> kind, first queries only
+    for r, q in enumerate(q0):
+        for t in range(q["answer_start"], q["answer_end"]):
+            if int(tok[r, t]) == BACKTRACK:
+                kinds[(r, t)] = "backtrack"
+            elif t == q["answer_start"] or int(tok[r, t - 1]) == BACKTRACK:
+                kinds[(r, t)] = "branch_start"
+            else:
+                kinds[(r, t)] = "successor"
+    pick = {}
+    for kind in ("backtrack", "branch_start", "successor"):
+        cells = [rt for rt, k in kinds.items() if k == kind and rt[0] not in {x[0] for x in pick.values()}
+                 and (kind != "branch_start" or int(tok[rt[0], rt[1] - 1]) == BACKTRACK)]
+        assert cells, kind
+        pick[kind] = cells[0]
+    wrong = {rt: (int(tok[rt]) + 1) % VOCAB.size for rt in pick.values()}
+    r = evaluate_set(Predicts(wrong), data, "cpu")
+    got = r["first_query_token_kinds"]
+    for d in sorted({q["depth"] for q in q0}):
+        for kind in ("successor", "backtrack", "branch_start"):
+            cells = [rt for rt, k in kinds.items() if k == kind and q0[rt[0]]["depth"] == d]
+            if not cells:
+                assert kind not in got[f"d{d}"]
+                continue
+            bad = sum(rt in wrong for rt in cells)
+            assert got[f"d{d}"][kind]["n"] == len(cells)
+            assert abs(got[f"d{d}"][kind]["accuracy"] - (len(cells) - bad) / len(cells)) < 1e-12, (d, kind)
+    assert abs(r["first_query_exact_match"] - (12 - 3) / 12) < 1e-12
+    for fmt in ("direct", "frontier"):
+        assert "first_query_token_kinds" not in evaluate_set(NextTokenOracle(offset=1),
+                                                             loaded(MULTI.replace(answer_format=fmt), 4), "cpu")
 
 
 def test_first_query_counts_by_depth_and_branching():
