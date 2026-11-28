@@ -105,11 +105,11 @@ def test_after_check():
             raise AssertionError(bad)
 
 
-def _setup(d, **cur_kw):
-    """A suite with the three check sets and a curriculum file in d."""
+def _setup(d, fmt="direct", **cur_kw):
+    """A suite with the three check sets (answers in format fmt) and a curriculum file in d."""
     suite_dir = os.path.join(d, "suite")
     for i, st in enumerate(STAGES, start=1):
-        cfg = BASE.replace(name=st["check_set"], depth=i)
+        cfg = BASE.replace(name=st["check_set"], depth=i, answer_format=fmt)
         write_set(os.path.join(suite_dir, st["check_set"]), cfg, 6, 1, stream_id(st["check_set"]), readable=0)
     path = os.path.join(d, f"cur_{len(os.listdir(d))}.json")
     with open(path, "w") as f:
@@ -146,7 +146,10 @@ def test_curriculum_training():
         assert stages == {2: 1, 4: 2, 6: 3}  # logged before the check that ends the stage
         assert [r["curriculum/check_stage"] for r in rows if "curriculum/check" in r] == [1, 2, 3]
         assert all("train/first_query_exact_match" in r for r in rows if "train/loss" in r)
-        assert os.path.exists(os.path.join(d, "full", "model_step_6.pt"))
+        for n in (2, 4, 6):  # at every stage advance and at the end
+            assert os.path.exists(os.path.join(d, "full", f"model_step_{n}.pt")), n
+        w2 = torch.load(os.path.join(d, "full", "model_step_2.pt"), weights_only=False)
+        assert w2["step"] == 2
         saved = torch.load(os.path.join(d, "full", "ckpt_latest.pt"), weights_only=False)
         assert saved["curriculum_state"]["status"] == "completed" and saved["step"] == 6
         # Submitted again: nothing happens
@@ -198,6 +201,27 @@ def test_curriculum_failure():
         assert main(argv) == CURRICULUM_FAILED
         n = len(_rows(d, "fail2"))
         assert main(argv) == CURRICULUM_FAILED and len(_rows(d, "fail2")) == n  # not restarted
+
+
+def test_frontier_curriculum_logs_levels():
+    """With frontier answers, the checks and the periodic evaluation log the bracket levels."""
+    with tempfile.TemporaryDirectory() as d:
+        suite_dir, path = _setup(d, fmt="frontier", threshold=-1.0)
+        cfg = _cfg(d, "fr", suite_dir, path, eval_interval=2, eval_sets="cfg/c2,cfg/c3", eval_samples=6)
+        out = train(cfg, ModelConfig(**TINY), BASE.replace(answer_format="frontier"))
+        assert out["curriculum"] == "completed"
+        rows = _rows(d, "fr")
+        checks = [r for r in rows if "curriculum/check" in r]
+        assert [sorted(k for k in r if k.startswith("curriculum/check_level")) for r in checks] == \
+            [["curriculum/check_level1", "curriculum/check_level1_set"],
+             ["curriculum/check_level1", "curriculum/check_level1_set", "curriculum/check_level2",
+              "curriculum/check_level2_set"],
+             [f"curriculum/check_level{k}{s}" for k in (1, 2, 3) for s in ("", "_set")]]
+        assert all("curriculum/check_final" in r for r in checks)
+        ev = [r for r in rows if "eval/cfg/c3/first_query_exact_match" in r]
+        assert ev and all(f"eval/cfg/c3/first_query_level{k}" in r and f"eval/cfg/c2/first_query_level{k}_set" in r
+                          for r in ev for k in (1, 2))
+        assert all(0.0 <= r[k] <= 1.0 for r in ev for k in r if "level" in k)
 
 
 def test_missing_check_set():

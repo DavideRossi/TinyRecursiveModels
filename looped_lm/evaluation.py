@@ -14,7 +14,10 @@ import torch.nn.functional as F
 
 from .dataset_generation.dataset import collate, to_item
 from .dataset_generation.storage import StoredSet
-from .objective import ANSWER_ROLES, ROLE_FINAL, query_exact, to_device
+from .dataset_generation.vocab import OPEN
+from .objective import ANSWER_ROLES, MAX_DEPTH, ROLE_FINAL, query_exact, to_device
+
+ROLE_INTERMEDIATE = 2
 
 
 def wilson(k: int, n: int, z: float = 1.959964) -> tuple:
@@ -43,13 +46,49 @@ def score_batch(model, batch: dict) -> Dict[str, np.ndarray]:
     p = torch.where(final, batch["pred_pos"][b, t], t - 1)
     logits = model.head(hidden[b, p]).float()
     target = tokens[b, t]
-    correct = logits.argmax(-1) == target
+    pred = logits.argmax(-1)
+    correct = pred == target
     exact = query_exact(batch, b, t, correct)
+    level_ok, level_set = bracket_levels(b.cpu().numpy(), batch["query_index"][b, t].cpu().numpy(),
+                                         role[b, t].cpu().numpy(), target.cpu().numpy(), pred.cpu().numpy(),
+                                         correct.cpu().numpy())
+    fin = final.cpu().numpy()
+    level_ok, level_set = level_ok[fin], level_set[fin]
     b, t, logits, target, correct, exact = b[final], t[final], logits[final], target[final], correct[final], exact[final]
-    return {"correct": correct.cpu().numpy(), "exact": exact.cpu().numpy(),
+    return {"correct": correct.cpu().numpy(), "exact": exact.cpu().numpy(), "level_ok": level_ok, "level_set": level_set,
             "loss": F.cross_entropy(logits, target, reduction="none").cpu().numpy(),
             "depth": batch["depth"][b, t].cpu().numpy(), "branching": batch["branching"][b, t].cpu().numpy(),
             "query_index": batch["query_index"][b, t].cpu().numpy(), "row": b.cpu().numpy()}
+
+
+def bracket_levels(rows, queries, roles, targets, preds, correct):
+    """Per answer token (in row-major order, as nonzero returns them; the tokens of a query are
+    contiguous), for answers with brackets (frontier): at the query's final token, row k - 1 of
+    level_ok says whether every token of bracket level k ([, its nodes, ]) is right under teacher
+    forcing, and of level_set whether its nodes' predictions are the right nodes as a multiset
+    (right set, any order). -1 elsewhere and for answers without brackets. Level k is the k-th
+    bracket of the answer (the nodes at distance k from the source)."""
+    n = len(rows)
+    level_ok = np.full((n, MAX_DEPTH), -1, dtype=np.int8)
+    level_set = np.full((n, MAX_DEPTH), -1, dtype=np.int8)
+    if n == 0:
+        return level_ok, level_set
+    starts = np.flatnonzero((np.diff(rows) != 0) | (np.diff(queries) != 0)) + 1
+    for g in np.split(np.arange(n), starts):
+        if queries[g[0]] < 0:
+            continue
+        lvl = np.cumsum(targets[g] == OPEN)
+        fin = g[roles[g] == ROLE_FINAL]
+        if lvl[-1] == 0 or len(fin) != 1:
+            continue
+        inner = roles[g] != ROLE_FINAL
+        nodes = inner & (roles[g] == ROLE_INTERMEDIATE)
+        for k in range(1, min(int(lvl[-1]), MAX_DEPTH) + 1):
+            m = inner & (lvl == k)
+            level_ok[fin[0], k - 1] = bool(correct[g][m].all())
+            mk = nodes & (lvl == k)
+            level_set[fin[0], k - 1] = bool(np.array_equal(np.sort(preds[g][mk]), np.sort(targets[g][mk])))
+    return level_ok, level_set
 
 
 def length_batches(lengths: List[int], max_tokens: int, max_batch: int = 256) -> List[List[int]]:
@@ -91,16 +130,20 @@ def evaluate_set(model, loaded: dict, device, amp: bool = True, by_db: Optional[
     branching (first_query_by_branching["b1"], ...). Exact match (every answer token right, see
     objective.query_exact; the final answer's accuracy in the direct format): exact_match and
     first_query_exact_match, and for sets mixing depths, exact_match_by_depth["d1"] and
-    first_query_exact_match_by_depth["d1"], ... (summaries like the others)."""
+    first_query_exact_match_by_depth["d1"], ... (summaries like the others). For answers with
+    brackets (frontier), first_query_levels["d<d>"] per depth of the first queries: n, level[k - 1]
+    (bracket level k entirely right under teacher forcing), level_set[k - 1] (its nodes right as a
+    set, in any order) and final (the final selection, given the correct brackets)."""
     was_training = model.training
     model.eval()
-    cols = {k: [] for k in ("correct", "exact", "loss", "depth", "branching", "query_index", "chance")}
+    cols = {k: [] for k in ("correct", "exact", "level_ok", "level_set", "loss", "depth", "branching", "query_index",
+                            "chance")}
     for batch in loaded["batches"]:
         dev = to_device(batch, device)
         with torch.autocast(device_type=torch.device(device).type, dtype=torch.bfloat16,
                             enabled=amp and torch.device(device).type == "cuda"):
             s = score_batch(model, dev)
-        for k in ("correct", "exact", "loss", "depth", "branching", "query_index"):
+        for k in ("correct", "exact", "level_ok", "level_set", "loss", "depth", "branching", "query_index"):
             cols[k].append(s[k])
         cols["chance"].append(1.0 / batch["num_targets"].numpy()[s["row"]])
     model.train(was_training)
@@ -126,6 +169,16 @@ def evaluate_set(model, loaded: dict, device, amp: bool = True, by_db: Optional[
     if len(depths) > 1:
         for key, m in (("exact_match_by_depth", everything), ("first_query_exact_match_by_depth", first)):
             out[key] = {f"d{int(v)}": summary(m & (c["depth"] == v), "exact") for v in depths}
+    lv, ls = c["level_ok"], c["level_set"]
+    if lv.ndim == 2 and (lv >= 0).any():
+        out["first_query_levels"] = {}
+        for d in sorted(set(c["depth"][first].tolist())):
+            m = first & (c["depth"] == d)
+            levels = [k for k in range(MAX_DEPTH) if (lv[m, k] >= 0).any()]
+            out["first_query_levels"][f"d{int(d)}"] = {
+                "n": int(m.sum()), "final": float(c["correct"][m].mean()),
+                "level": [float(lv[m, k][lv[m, k] >= 0].mean()) for k in levels],
+                "level_set": [float(ls[m, k][ls[m, k] >= 0].mean()) for k in levels]}
     out["num_samples"] = loaded["num_samples"]
     out["tokens_mean"] = loaded["tokens_mean"]
     if by_db is None:

@@ -311,6 +311,31 @@ def test_eval_suite_held_out_configs():
     assert (long.num_queries.max, long.num_targets.min, long.total_edges.min, long.total_edges.max) == (4, 5, 192, 512)
 
 
+def test_write_with_another_answer_format():
+    """write --answer_format: the same graphs with answers in that format, by default in
+    looped_lm/data/<suite>_<format>."""
+    from looped_lm.dataset_generation import cli
+    with tempfile.TemporaryDirectory() as d:
+        old = cli.DATA_DIR
+        cli.DATA_DIR = d
+        try:
+            cli.main(["write", "--suite", SUITE, "--only", "cfg/train_d2", "grid/d4_b2", "--num", "5"])
+            cli.main(["write", "--suite", SUITE, "--only", "cfg/train_d2", "grid/d4_b2", "--num", "5",
+                      "--answer_format", "frontier", "--check"])
+        finally:
+            cli.DATA_DIR = old
+        for name in ("cfg/train_d2", "grid/d4_b2"):
+            a, b = StoredSet(os.path.join(d, "eval_suite", name)), StoredSet(os.path.join(d, "eval_suite_frontier", name))
+            assert a.config.answer_format == "direct" and b.config.answer_format == "frontier"
+            assert b.config.to_dict() == a.config.replace(answer_format="frontier").to_dict()
+            for i in range(5):
+                ra, rb = a.get(i), b.get(i)
+                assert [q["path"] for q in ra["queries"]] == [q["path"] for q in rb["queries"]]
+                assert ra["num_edges"] == rb["num_edges"] and len(rb["tokens"]) > len(ra["tokens"])
+                n = ra["queries"][0]["prompt_pos"]  # identical up to the first query
+                assert np.array_equal(ra["tokens"][:n], rb["tokens"][:n])
+
+
 def test_audit_at_chance_and_detects_a_planted_shortcut():
     cfg = TaskConfig(depth=3, branching=3, num_queries=1, num_distractors=5, total_edges=54)
     r = audit_mod.audit(cfg, 600)

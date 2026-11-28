@@ -160,14 +160,18 @@ it reaches the threshold (≥), the next stage starts from the next step. The mo
 and learning-rate schedule carry on; only the data change. The run ends when the last stage
 passes ("completed"), or when a stage has run `max_stage_steps` steps without passing
 ("failed": exit status 4, so the Slurm job fails). Either way it saves `ckpt_latest.pt` and
-`model_step_N.pt` and runs the periodic evaluation. `--steps` is only a cap.
+`model_step_N.pt` and runs the periodic evaluation. `--steps` is only a cap. Every stage
+advance also saves `model_step_N.pt`: the weights that passed the stage, to start other runs
+from. After a completed run, `ckpt_latest.pt` holds the final weights, so a follow-up job can be
+chained with `--dependency=afterok` and `--init_from RUN_DIR/ckpt_latest.pt`.
 - **Data:** stage k draws batch j (its j-th step) from stream k of the training split, so the
   data are a pure function of (seed, stage, step within stage), and stages never share batches.
 - **Resuming** restores the stage and its start step, and refuses another curriculum file. A run
   whose curriculum has ended is not restarted (exit status 4 again if it failed).
 - **Logged:** `curriculum/stage` (1-based) and `curriculum/stage_step` every `log_interval`;
-  `curriculum/check` and `curriculum/check_stage` at every check. The periodic evaluation also
-  runs at every stage change.
+  `curriculum/check` and `curriculum/check_stage` at every check, and for frontier answers the
+  check set's bracket levels (`curriculum/check_level<k>`, `_level<k>_set`,
+  `curriculum/check_final`, see §3). The periodic evaluation also runs at every stage change.
 - **`curriculum.json`** in the run directory, rewritten at every change: `status` (running |
   completed | failed), the current stage and its start step, and per stage started its name,
   `start_step`, `end_step`, `reason` (advanced | completed | max_steps | running) and the last
@@ -203,7 +207,9 @@ time, add workers).
 cross-entropy on final answers), `eval/<set>/chance`, `eval/<set>/n`, and
 `eval/<set>/first_query_accuracy` / `eval/<set>/first_query_chance` (first queries only), and
 for sets that mix depths (branchings) `eval/<set>/first_query_accuracy_d<d>` (`_b<b>`), and
-`eval/<set>/exact_match` / `first_query_exact_match` (with `_d<d>` for sets mixing depths). **Watch the loss as well
+`eval/<set>/exact_match` / `first_query_exact_match` (with `_d<d>` for sets mixing depths), and
+for frontier answers `eval/<set>/first_query_level<k>`, `_level<k>_set` and `_final` (§3; with
+`d<d>_` before `level` for sets mixing depths). **Watch the loss as well
 as the accuracy:** on these tasks accuracy can sit at chance and then jump, and the loss usually
 moves first. The run fails at start if a set is missing (write the suite first, §4). At step 0
 and at every evaluation it also logs the mean and maximum L2 norm of the embedding rows, over
@@ -248,6 +254,18 @@ python -m looped_lm.evaluate --checkpoint checkpoints/looped_lm/RUN/model_step_2
   greedy decoding reproduces the answer. In the direct format it equals the final answer's
   accuracy. In the path, frontier and dfs formats it is the measure to use: the final answer
   alone is predicted with the path so far given, so its accuracy measures one step only.
+- **Bracket levels** (frontier answers; `first_query_levels` in the JSON, per depth of the first
+  queries). Level k is the k-th bracket, `[` then the nodes at distance k from the source in
+  canonical branch order then `]`. Each token there is a one-hop lookup from the previous
+  bracket; at level 1, the source's children in the order of their edges.
+  - `level[k-1]`: level k entirely right under teacher forcing.
+  - `level_set[k-1]`: its nodes predicted as the right multiset, in any order. Where `level`
+    fails but `level_set` holds, the nodes are right and only their order is wrong.
+  - `final`: the final selection, the target among the last bracket's nodes, given the correct
+    brackets (= `first_query_accuracy`).
+  Answers are d·(b + 2) + 1 tokens plus the end token: 7 at d1 b4, 25 at d4 b4, 49 at d8 b4.
+  Samples of train.json are 5% longer than in the direct format (1,112 tokens on average at
+  depths 1–8, at most about 1,700).
 - **Output:** `<run>/eval/<checkpoint>_step<N>.json` (all results, configs and paths) and `.csv`
   (one row per set, plus one per (d, b) with the `depth` and `branching` columns filled), for
   comparing runs in a notebook. `--out` changes the directory.
@@ -497,11 +515,41 @@ RUN_NAME=curr_L8_s0 DEPTH=8 WIDTH=256 SEED=0 sbatch --time=02:00:00 slurm/train_
 `curriculum.json` in the run directory then gives the steps spent in each stage and where the
 run ended.
 
+**Result (direct format, L8 seeds 0–2 and L2 seeds 1–2, from the phase 2 long checkpoints).**
+Stage 1 passed in 4 of 5 runs: L8 at steps 2,250–3,250, L2 s1 at 9,500. L2 s2 reached 0.868 in
+10,000 steps. Stage 2 failed in all 4 runs that reached it. Depth 2 stayed at chance (first-query
+exact match 0.06–0.13) for 10,000 steps, while depth 1 held at 0.85–0.97. The direct format
+gives no signal at depth 2.
+
+### Frontier format
+
+**Why frontier, not path.** With branching above 1, the first token of a path answer already
+needs the whole d-hop search (which child leads to a target), and every later token is a
+trivial successor. Under teacher forcing that is the path-star failure (Bachmann & Nagarajan,
+2024). In the frontier format every token is a one-hop lookup from the previous bracket, and
+the final token selects among the last bracket (§3, "Bracket levels").
+
+**Recipe:** frontier evaluation sets in their own directory, the same graphs as the direct
+ones. A stage-1 run in the direct format is chained to the depth curriculum in the frontier
+format:
+
+```bash
+python -m looped_lm.dataset_generation.cli write --suite looped_lm/dataset_generation/configs/eval_suite.json \
+    --answer_format frontier --only grid/ cfg/train --check      # -> looped_lm/data/eval_suite_frontier
+j=$(RUN_NAME=s1_L8_s0 DEPTH=8 WIDTH=256 SEED=0 sbatch --parsable slurm/train_looped_lm.sbatch \
+    --curriculum looped_lm/configs/curriculum_depth_stage1.json --steps 10000 --lr 3e-4 --min_lr_ratio 1.0 \
+    --compile true --init_from PHASE2_RUN/model_step_10000.pt)
+RUN_NAME=fr_L8_s0 DEPTH=8 WIDTH=256 SEED=0 sbatch --dependency=afterok:$j slurm/train_looped_lm.sbatch \
+    --curriculum looped_lm/configs/curriculum_depth.json --answer_format frontier \
+    --eval_suite looped_lm/data/eval_suite_frontier --steps 40000 --lr 3e-4 --min_lr_ratio 1.0 --compile true \
+    --init_from checkpoints/looped_lm/s1_L8_s0/ckpt_latest.pt
+```
+
 ## 7. Tests
 
 ```bash
-python tests/looped_lm/test_model.py       # 10 tests, CPU, under a minute
-python tests/looped_lm/test_curriculum.py  # 6 tests
+python tests/looped_lm/test_model.py       # 11 tests, CPU, under a minute
+python tests/looped_lm/test_curriculum.py  # 7 tests
 python tests/looped_lm/test_mqar.py        # 5 tests
 python tests/looped_lm/test_induction.py   # 8 tests
 ```
@@ -513,7 +561,9 @@ python tests/looped_lm/test_induction.py   # 8 tests
   within stage), differs from other stages and seeds, and has the stage's depth mix. The
   stage logic advances, completes and fails at the step limit, and rejects invalid files. A
   run with checks that always pass goes through the stages at the expected steps, logs the
-  stage, writes `curriculum.json` and a final `model_step_N.pt`, and is not restarted. A run
+  stage, writes `curriculum.json`, a `model_step_N.pt` at every stage advance and at the end,
+  and is not restarted. With frontier answers, the checks and the periodic evaluation log the
+  bracket levels of each depth. A run
   interrupted mid-stage and resumed (across a stage change) gives the same losses as an
   uninterrupted one. A run doesn't resume under another curriculum file. A stage that never
   passes stops the run at its limit, with a checkpoint, the stage log and exit status 4, and
@@ -555,6 +605,10 @@ python tests/looped_lm/test_induction.py   # 8 tests
 - **Exact match:** in the path format, a wrong intermediate node leaves every final answer
   right but its query wrong, in the objective's counts (all queries, first queries, by depth)
   and in the evaluation alike; in the direct format, exact match equals final-answer accuracy.
+- **Bracket levels (frontier):** with two level-1 children swapped, level 1 is wrong but its
+  set is right; with a wrong node at level 2, level 2 is wrong, set included; every other level
+  and the final selection stay right, and exact match fails for both queries; a clean oracle
+  gets every level; the direct format has no levels.
 - **Evaluation:** with an oracle stub whose hidden state at position p encodes the token at
   p + 1, every answer is correct, chance and the Wilson interval are right, and the (d, b)
   breakdown adds up; the first-query results by depth and by branching count each value's first

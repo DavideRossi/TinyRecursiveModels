@@ -1,0 +1,11 @@
+{
+ "threshold": 0.9,
+ "check_metric": "first_query_exact_match",
+ "check_interval": 250,
+ "check_samples": 1000,
+ "max_stage_steps": 10000,
+ "stages": [
+  {"name": "d1", "check_set": "cfg/train_d1",
+   "overrides": {"depth": 1}}
+ ]
+}

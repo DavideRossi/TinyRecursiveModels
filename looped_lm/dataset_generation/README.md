@@ -577,9 +577,11 @@ curriculum, looped_lm/README.md §2).
 prefixes) to leave sets out; `--only` selects instead (`write --only cfg/` writes only the
 held-out sets, leaving the others on disk as they are).
 
-**The answer format** belongs to the suite: write one suite per format you train with, e.g.
-a copy `eval_suite_dfs.json` with `"answer_format": "dfs"`, which `write` puts in
-`looped_lm/data/eval_suite_dfs/`.
+**The answer format** belongs to the written sets: write one suite directory per format you
+train with. `write --answer_format frontier` overrides the format of every set it writes and
+puts them, unless `--out` says otherwise, in `looped_lm/data/<suite>_frontier/`. The graphs are
+the same as in the direct sets: only the answers differ, so results compare sample for sample.
+Without the option, a copy of the suite with another `"answer_format"` does the same.
 
 **Layout written by `write --suite S [--out DIR]`** (DIR defaults to `looped_lm/data/<S without .json>`):
 
@@ -845,7 +847,7 @@ Measured in `fixed` mode, 2,000 samples per set.
 
 ```bash
 python tests/looped_lm/test_checker.py      # the checker on hand-written graphs (18 tests)
-python tests/looped_lm/test_generator.py    # generator, datasets, storage, suites, audit (30 tests)
+python tests/looped_lm/test_generator.py    # generator, datasets, storage, suites, audit (31 tests)
 ```
 
 `tests/looped_lm/per_component_reference.json` holds fingerprints of `per_component` samples

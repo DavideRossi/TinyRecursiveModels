@@ -5,6 +5,7 @@
     python -m looped_lm.dataset_generation.cli stats  (--config CFG.json | --suite SUITE.json) [--num 2000] [--batch-size B]
     python -m looped_lm.dataset_generation.cli audit  (--config CFG.json | --suite SUITE.json) [--num 2000]
     python -m looped_lm.dataset_generation.cli write  --suite SUITE.json [--out DIR] [--num N] [--check] [--skip PREFIX ...]
+                                                      [--only PREFIX ...] [--answer_format FMT]
     python -m looped_lm.dataset_generation.cli check  DIR
 
 See looped_lm/dataset_generation/README.md.
@@ -19,7 +20,7 @@ import time
 from . import suite as suite_mod
 from .audit import BACKWARD, EXCLUSION, HEURISTICS, audit, stats, summarize, z_threshold
 from .checker import CheckError, check_sample
-from .config import TaskConfig
+from .config import ANSWER_FORMATS, TaskConfig
 from .generate import make_sample
 from .storage import StoredSet, write_set
 from .vocab import VOCAB
@@ -164,8 +165,11 @@ def cmd_audit(args):
 def cmd_write(args):
     suite = suite_mod.load(args.suite)
     specs = _specs(args.suite, args.only, args.skip)
+    if args.answer_format:  # the same graphs, with answers in another format, in their own directory
+        specs = [s._replace(config=s.config.replace(answer_format=args.answer_format)) for s in specs]
     if args.out is None:
-        args.out = os.path.join(DATA_DIR, os.path.splitext(os.path.basename(args.suite))[0])
+        args.out = os.path.join(DATA_DIR, os.path.splitext(os.path.basename(args.suite))[0]
+                                + (f"_{args.answer_format}" if args.answer_format else ""))
     print(f"writing to {args.out}" + (f" (only {', '.join(args.only)})" if args.only else "")
           + (f" (skipping {', '.join(args.skip)})" if args.skip else ""))
     os.makedirs(args.out, exist_ok=True)
@@ -252,7 +256,10 @@ def main(argv=None):
     sp.set_defaults(func=cmd_audit)
     sp = sub.add_parser("write", help="write the fixed sets of a suite")
     sp.add_argument("--suite", required=True)
-    sp.add_argument("--out", help="output directory (default: looped_lm/data/<suite file name without .json>)")
+    sp.add_argument("--out", help="output directory (default: looped_lm/data/<suite file name without .json>, "
+                    "with _<answer_format> appended when --answer_format is given)")
+    sp.add_argument("--answer_format", choices=ANSWER_FORMATS,
+                    help="override every set's answer format (the graphs stay the same)")
     sp.add_argument("--num", type=int, help="samples per set (overrides the suite)")
     sp.add_argument("--check", action="store_true", help="run the checker on every written sample")
     sp.add_argument("--only", nargs="+", help="only the sets whose name starts with one of these, e.g. cfg/")

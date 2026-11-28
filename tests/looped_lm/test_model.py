@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from looped_lm.dataset_generation.config import TaskConfig  # noqa: E402
 from looped_lm.dataset_generation.dataset import collate, to_item  # noqa: E402
 from looped_lm.dataset_generation.generate import make_sample  # noqa: E402
-from looped_lm.dataset_generation.vocab import PAD, VOCAB  # noqa: E402
+from looped_lm.dataset_generation.vocab import CLOSE, OPEN, PAD, VOCAB  # noqa: E402
 from looped_lm.evaluation import evaluate_set, wilson  # noqa: E402
 from looped_lm.model import LoopedLM, ModelConfig  # noqa: E402
 from looped_lm.objective import loss_and_stats  # noqa: E402
@@ -249,6 +249,58 @@ def test_exact_match():
     assert int(st["exact_correct"]) == int(st["final_correct"]) and int(st["first_exact_correct"]) == int(st["first_correct"])
     r = evaluate_set(wrong, direct, "cpu")
     assert r["exact_match"] == r["accuracy"] and r["first_query_exact_match"] == r["first_query_accuracy"]
+
+
+class Predicts(NextTokenOracle):
+    """The next-token oracle, except that it predicts the given token for the given (row, position)."""
+
+    def __init__(self, cells):
+        super().__init__(offset=1)
+        self.cells = cells
+
+    def forward(self, tokens):
+        shifted = torch.roll(tokens, -1, dims=1)
+        for (r, t), tok in self.cells.items():
+            shifted[r, t - 1] = tok
+        return 30.0 * F.one_hot(shifted, VOCAB.size).float()
+
+
+def test_frontier_levels():
+    """Bracket levels of frontier answers: two children swapped at level 1 make level 1 wrong but
+    its set right; a wrong node at level 2 makes level 2 wrong, set included; the other levels and
+    the final selection stay right; exact match fails for both queries. The direct format has no
+    levels."""
+    fr = MULTI.replace(answer_format="frontier", branching=2)
+    data = loaded(fr, 8)
+    batch = data["batches"][0]
+    tok = batch["tokens"]
+    q0 = [qs[0] for qs in batch["queries"]]
+    deep = [r for r, q in enumerate(q0) if q["depth"] >= 2]
+    assert len(deep) >= 2
+    rs, rw = deep[0], deep[1]
+    a = q0[rs]["answer_start"]  # "[ n1 n2 ]" at a .. a + 3
+    assert int(tok[rs, a]) == OPEN and int(tok[rs, a + 3]) == CLOSE
+    a2 = q0[rw]["answer_start"] + 4  # level 2 of rw: "[ m1 m2 ]" from a2
+    assert int(tok[rw, a2]) == OPEN
+    cells = {(rs, a + 1): int(tok[rs, a + 2]), (rs, a + 2): int(tok[rs, a + 1]),
+             (rw, a2 + 1): (int(tok[rw, a2 + 1]) + 1) % VOCAB.size}
+    r = evaluate_set(Predicts(cells), data, "cpu")
+    assert r["first_query_accuracy"] == 1.0 and abs(r["first_query_exact_match"] - 6 / 8) < 1e-12
+    levels = r["first_query_levels"]
+    for dk, v in levels.items():
+        d = int(dk[1:])
+        rows = [i for i, q in enumerate(q0) if q["depth"] == d]
+        assert v["n"] == len(rows) and len(v["level"]) == d and v["final"] == 1.0
+        n = len(rows)
+        for k in range(1, d + 1):
+            bad = (rs in rows and k == 1) + (rw in rows and k == 2)
+            bad_set = rw in rows and k == 2
+            assert abs(v["level"][k - 1] - (n - bad) / n) < 1e-12, (dk, k, v)
+            assert abs(v["level_set"][k - 1] - (n - bad_set) / n) < 1e-12, (dk, k, v)
+    # With nothing wrong, every level is right; the direct format has no levels
+    clean = evaluate_set(NextTokenOracle(offset=1), data, "cpu")["first_query_levels"]
+    assert all(x == 1.0 for v in clean.values() for x in v["level"] + v["level_set"])
+    assert "first_query_levels" not in evaluate_set(NextTokenOracle(offset=1), loaded(MULTI, 4), "cpu")
 
 
 def test_first_query_counts_by_depth_and_branching():

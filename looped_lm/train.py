@@ -212,6 +212,19 @@ def gate_metric(task) -> str:
     return "final_accuracy" if isinstance(task, InductionConfig) else "first_query_accuracy"
 
 
+def level_metrics(r: dict, prefix: str) -> dict:
+    """Bracket-level results of evaluate_set (frontier answers), as flat metrics: prefix + level<k>,
+    level<k>_set and final; with several depths, prefix + d<d>_level<k> and so on."""
+    levels = r.get("first_query_levels", {})
+    out = {}
+    for dk, v in levels.items():
+        pre = prefix if len(levels) == 1 else f"{prefix}{dk}_"
+        for k, (a, st) in enumerate(zip(v["level"], v["level_set"]), start=1):
+            out[f"{pre}level{k}"], out[f"{pre}level{k}_set"] = a, st
+        out[f"{pre}final"] = v["final"]
+    return out
+
+
 def train(cfg: TrainConfig, model_cfg: ModelConfig, task: Optional[TaskConfig] = None,
           stop_after: Optional[int] = None, record_losses: bool = False) -> dict:
     """Train (or resume) a run. stop_after: stop with a checkpoint once this step is reached, as if
@@ -352,6 +365,7 @@ def train(cfg: TrainConfig, model_cfg: ModelConfig, task: Optional[TaskConfig] =
             for key in ("exact_match_by_depth", "first_query_exact_match_by_depth"):  # sets mixing depths only
                 metric = key[:-len("_by_depth")]
                 out.update({f"eval/{name}/{metric}_{k}": s["accuracy"] for k, s in r.get(key, {}).items()})
+            out.update(level_metrics(r, f"eval/{name}/first_query_"))  # bracketed answers (frontier) only
         out.update({f"model/{k}": v for k, v in model.embed_norms().items()})
         return out
 
@@ -448,13 +462,15 @@ def train(cfg: TrainConfig, model_cfg: ModelConfig, task: Optional[TaskConfig] =
                 r = evaluate_set(model, check_data[cur.stages[k].check_set], device)
                 value = r[cur.check_metric]
                 stage_event = after_check(cur, cstate, step, value)
-                logger.log({"curriculum/check": value, "curriculum/check_stage": k + 1}, step=step)
+                logger.log({"curriculum/check": value, "curriculum/check_stage": k + 1,
+                            **level_metrics(r, "curriculum/check_")}, step=step)
                 t_last = time.time()
                 if stage_event is not None:
                     write_log(cfg.run_dir, cur, cstate)
                     print(f"step {step}: stage {k + 1} ({cur.stages[k].name}) {stage_event}, "
                           f"{cur.check_metric} {value:.3f}", flush=True)
                 if stage_event == "advanced":  # the next stage's stream, from its step 0
+                    checkpoint(milestone=True)  # the weights that passed the stage (model_step_N.pt)
                     del it
                     loader = make_loader()
                     it = iter(loader)
