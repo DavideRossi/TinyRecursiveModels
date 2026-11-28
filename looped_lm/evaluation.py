@@ -14,7 +14,7 @@ import torch.nn.functional as F
 
 from .dataset_generation.dataset import collate, to_item
 from .dataset_generation.storage import StoredSet
-from .objective import ROLE_FINAL, to_device
+from .objective import ANSWER_ROLES, ROLE_FINAL, query_exact, to_device
 
 
 def wilson(k: int, n: int, z: float = 1.959964) -> tuple:
@@ -29,15 +29,24 @@ def wilson(k: int, n: int, z: float = 1.959964) -> tuple:
 
 
 def score_batch(model, batch: dict) -> Dict[str, np.ndarray]:
-    """Per final answer: correct (argmax at pred_pos == answer token), its cross-entropy, the query's
-    d and b, its index among the sample's queries, and the sample's row in the batch."""
-    tokens = batch["tokens"]
+    """Per final answer: correct (argmax at pred_pos == answer token), its cross-entropy, exact
+    (every answer token of its query correct, objective.query_exact), the query's d and b, its index
+    among the sample's queries, and the sample's row in the batch. Answer tokens other than the
+    final one are predicted at their position - 1."""
+    tokens, role = batch["tokens"], batch["role"]
+    answer = role == ROLE_FINAL
+    for r in ANSWER_ROLES:
+        answer |= (role == r) & (batch["query_index"] >= 0)
     hidden = model(tokens)
-    b, t = (batch["role"] == ROLE_FINAL).nonzero(as_tuple=True)
-    p = batch["pred_pos"][b, t]
+    b, t = answer.nonzero(as_tuple=True)
+    final = role[b, t] == ROLE_FINAL
+    p = torch.where(final, batch["pred_pos"][b, t], t - 1)
     logits = model.head(hidden[b, p]).float()
     target = tokens[b, t]
-    return {"correct": (logits.argmax(-1) == target).cpu().numpy(),
+    correct = logits.argmax(-1) == target
+    exact = query_exact(batch, b, t, correct)
+    b, t, logits, target, correct, exact = b[final], t[final], logits[final], target[final], correct[final], exact[final]
+    return {"correct": correct.cpu().numpy(), "exact": exact.cpu().numpy(),
             "loss": F.cross_entropy(logits, target, reduction="none").cpu().numpy(),
             "depth": batch["depth"][b, t].cpu().numpy(), "branching": batch["branching"][b, t].cpu().numpy(),
             "query_index": batch["query_index"][b, t].cpu().numpy(), "row": b.cpu().numpy()}
@@ -79,23 +88,26 @@ def evaluate_set(model, loaded: dict, device, amp: bool = True, by_db: Optional[
     earlier answer in the context, so the elimination heuristic can't help); for sets with several
     queries per sample, also by the query's (d, b); for sets whose first queries have several
     depths (branchings), first-query results by depth (first_query_by_depth["d1"], ...) and by
-    branching (first_query_by_branching["b1"], ...)."""
+    branching (first_query_by_branching["b1"], ...). Exact match (every answer token right, see
+    objective.query_exact; the final answer's accuracy in the direct format): exact_match and
+    first_query_exact_match, and for sets mixing depths, exact_match_by_depth["d1"] and
+    first_query_exact_match_by_depth["d1"], ... (summaries like the others)."""
     was_training = model.training
     model.eval()
-    cols = {k: [] for k in ("correct", "loss", "depth", "branching", "query_index", "chance")}
+    cols = {k: [] for k in ("correct", "exact", "loss", "depth", "branching", "query_index", "chance")}
     for batch in loaded["batches"]:
         dev = to_device(batch, device)
         with torch.autocast(device_type=torch.device(device).type, dtype=torch.bfloat16,
                             enabled=amp and torch.device(device).type == "cuda"):
             s = score_batch(model, dev)
-        for k in ("correct", "loss", "depth", "branching", "query_index"):
+        for k in ("correct", "exact", "loss", "depth", "branching", "query_index"):
             cols[k].append(s[k])
         cols["chance"].append(1.0 / batch["num_targets"].numpy()[s["row"]])
     model.train(was_training)
     c = {k: np.concatenate(v) if v else np.zeros(0) for k, v in cols.items()}
 
-    def summary(m):
-        n, k = int(m.sum()), int(c["correct"][m].sum())
+    def summary(m, col="correct"):
+        n, k = int(m.sum()), int(c[col][m].sum())
         lo, hi = wilson(k, n)
         return {"n": n, "correct": k, "accuracy": k / n if n else float("nan"), "ci_low": lo, "ci_high": hi,
                 "chance": float(c["chance"][m].mean()) if n else float("nan"),
@@ -107,6 +119,13 @@ def evaluate_set(model, loaded: dict, device, amp: bool = True, by_db: Optional[
         values = sorted(set(c[col][first].tolist()))
         if len(values) > 1:
             out[key] = {f"{prefix}{int(v)}": summary(first & (c[col] == v)) for v in values}
+    everything = np.ones(len(c["correct"]), dtype=bool)
+    out["exact_match"] = summary(everything, "exact")["accuracy"]
+    out["first_query_exact_match"] = summary(first, "exact")["accuracy"]
+    depths = sorted(set(c["depth"].tolist()))
+    if len(depths) > 1:
+        for key, m in (("exact_match_by_depth", everything), ("first_query_exact_match_by_depth", first)):
+            out[key] = {f"d{int(v)}": summary(m & (c["depth"] == v), "exact") for v in depths}
     out["num_samples"] = loaded["num_samples"]
     out["tokens_mean"] = loaded["tokens_mean"]
     if by_db is None:

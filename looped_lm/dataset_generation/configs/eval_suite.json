@@ -36,7 +36,13 @@
  "configs": [
   {"name": "lookup_q16", "config": "diag_lookup_q16.json", "num_samples": 1000},
   {"name": "lookup_long", "config": "diag_lookup_long.json", "num_samples": 1000},
-  {"name": "train", "config": "train.json", "num_samples": 2000}
+  {"name": "train", "config": "train.json", "num_samples": 2000},
+  {"name": "train_d1", "config": "train.json", "num_samples": 1000, "overrides": {"depth": 1}},
+  {"name": "train_d2", "config": "train.json", "num_samples": 1000, "overrides": {"depth": 2}},
+  {"name": "train_d3", "config": "train.json", "num_samples": 1000, "overrides": {"depth": 3}},
+  {"name": "train_d4", "config": "train.json", "num_samples": 1000, "overrides": {"depth": 4}},
+  {"name": "train_d6", "config": "train.json", "num_samples": 1000, "overrides": {"depth": 6}},
+  {"name": "train_d8", "config": "train.json", "num_samples": 1000, "overrides": {"depth": 8}}
  ],
  "readable_samples": 5
 }

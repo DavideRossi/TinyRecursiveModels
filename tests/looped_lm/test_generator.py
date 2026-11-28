@@ -300,10 +300,12 @@ def test_suite_configs_section():
 def test_eval_suite_held_out_configs():
     """The suite's cfg/ sets are the training configs they name, under their set name."""
     specs = {x.name: x for x in suite.expand(suite.load(SUITE)) if x.name.startswith("cfg/")}
-    assert set(specs) == {"cfg/lookup_q16", "cfg/lookup_long", "cfg/train"}
-    for name, file, num in (("cfg/lookup_q16", "diag_lookup_q16.json", 1000),
-                            ("cfg/lookup_long", "diag_lookup_long.json", 1000), ("cfg/train", "train.json", 2000)):
-        cfg = TaskConfig.from_dict(json.load(open(os.path.join(os.path.dirname(SUITE), file))))
+    depths = (1, 2, 3, 4, 6, 8)
+    assert set(specs) == {"cfg/lookup_q16", "cfg/lookup_long", "cfg/train"} | {f"cfg/train_d{d}" for d in depths}
+    cases = [("cfg/lookup_q16", "diag_lookup_q16.json", 1000, {}), ("cfg/lookup_long", "diag_lookup_long.json", 1000, {}),
+             ("cfg/train", "train.json", 2000, {})] + [(f"cfg/train_d{d}", "train.json", 1000, {"depth": d}) for d in depths]
+    for name, file, num, over in cases:
+        cfg = TaskConfig.from_dict(dict(json.load(open(os.path.join(os.path.dirname(SUITE), file))), **over))
         assert specs[name].config.to_dict() == cfg.replace(name=name).to_dict() and specs[name].num_samples == num
     long = specs["cfg/lookup_long"].config
     assert (long.num_queries.max, long.num_targets.min, long.total_edges.min, long.total_edges.max) == (4, 5, 192, 512)

@@ -193,6 +193,64 @@ def first_query_db(batch):
     return out
 
 
+class WrongAt(NextTokenOracle):
+    """The next-token oracle, wrong at the given (row, token position) targets only."""
+
+    def __init__(self, cells):
+        super().__init__(offset=1)
+        self.cells = cells
+
+    def forward(self, tokens):
+        shifted = torch.roll(tokens, -1, dims=1)
+        for r, t in self.cells:
+            shifted[r, t - 1] = (shifted[r, t - 1] + 1) % VOCAB.size
+        return 30.0 * F.one_hot(shifted, VOCAB.size).float()
+
+
+def _intermediate_cells(batch, query):
+    """(row, position) of one intermediate answer token of the given query in each row that has one."""
+    out = []
+    for r in range(batch["tokens"].shape[0]):
+        pos = ((batch["role"][r] == 2) & (batch["query_index"][r] == query)).nonzero().flatten()
+        if len(pos):
+            out.append((r, int(pos[0])))
+    return out
+
+
+def test_exact_match():
+    """Exact match: a query counts only if every answer token is right. In the path format, a wrong
+    intermediate node leaves the final answer right but the query wrong, in the objective and in
+    the evaluation alike; in the direct format exact match is the final answer's accuracy."""
+    path = MULTI.replace(answer_format="path")
+    data = loaded(path, 8)
+    batch = data["batches"][0]
+    db = first_query_db(batch)
+    cells = _intermediate_cells(batch, 0)[:2] + _intermediate_cells(batch, 1)[:1]
+    assert len(cells) == 3 and len({r for r, _ in cells}) >= 2
+    rows0 = {r for r, t in cells if int(batch["query_index"][r, t]) == 0}
+    oracle = WrongAt(cells)
+    _, stats = loss_and_stats(oracle, batch)
+    assert int(stats["final_correct"]) == int(stats["final_n"]) == 16  # every final answer right
+    assert int(stats["exact_n"]) == 16 and int(stats["exact_correct"]) == 13
+    assert int(stats["first_exact_correct"]) == 8 - len(rows0) and int(stats["first_correct"]) == 8
+    for v in range(1, 4):
+        assert int(stats["first_exact_correct_by_depth"][v]) == sum(q[0] == v and r not in rows0 for r, q in enumerate(db))
+    assert int(stats["exact_n_by_depth"].sum()) == 16 and int(stats["exact_correct_by_depth"].sum()) == 13
+    r = evaluate_set(oracle, data, "cpu")
+    assert r["accuracy"] == 1.0 and r["first_query_accuracy"] == 1.0
+    assert abs(r["exact_match"] - 13 / 16) < 1e-12 and abs(r["first_query_exact_match"] - (8 - len(rows0)) / 8) < 1e-12
+    by = r["first_query_exact_match_by_depth"]
+    assert sum(s["n"] for s in by.values()) == 8 and sum(s["correct"] for s in by.values()) == 8 - len(rows0)
+    assert sum(s["correct"] for s in r["exact_match_by_depth"].values()) == 13
+    # Direct format: exact match = final-answer accuracy, in the objective and the evaluation
+    direct = loaded(MULTI, 6)
+    wrong = NextTokenOracle(offset=1, wrong_rows=(1, 4))
+    _, st = loss_and_stats(wrong, direct["batches"][0])
+    assert int(st["exact_correct"]) == int(st["final_correct"]) and int(st["first_exact_correct"]) == int(st["first_correct"])
+    r = evaluate_set(wrong, direct, "cpu")
+    assert r["exact_match"] == r["accuracy"] and r["first_query_exact_match"] == r["first_query_accuracy"]
+
+
 def test_first_query_counts_by_depth_and_branching():
     """The objective's first-query counts by d and b: the first queries of each value, adding up to
     first_n / first_correct; bin 0 stays empty on the graph task."""

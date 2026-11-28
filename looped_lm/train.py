@@ -11,7 +11,10 @@ the step); a run started with --init_from takes only the model weights of that c
 fresh optimizer, schedule and data stream (ignored when resuming). With --gate_step N, the run stops
 at step N (exit status 3, no checkpoint, gate.json in the run directory) unless the gate metric
 over the last log interval is above --gate_threshold: first-query accuracy, or on the induction
-task the accuracy on supervised tokens (--gate_enforce false: only record it). SIGUSR1 or SIGTERM (Slurm's time limit, see slurm/train_looped_lm.sbatch) saves a
+task the accuracy on supervised tokens (--gate_enforce false: only record it). With --curriculum
+FILE (looped_lm/curriculum.py), the data go through the file's stages, each a set of overrides of
+--data_config, advancing when a held-out check passes; the run ends when the last stage passes,
+or with exit status 4 when a stage reaches its step limit (curriculum.json in the run directory). SIGUSR1 or SIGTERM (Slurm's time limit, see slurm/train_looped_lm.sbatch) saves a
 checkpoint and stops.
 """
 import argparse
@@ -28,6 +31,7 @@ from typing import List, Optional
 import torch
 from torch.utils.data import DataLoader
 
+from .curriculum import Curriculum, after_check, initial_state, stream_of, write_log
 from .dataset_generation.config import TaskConfig
 from .dataset_generation.dataset import TrainStream
 from .diagnostics.induction import InductionConfig, InductionStream, is_induction
@@ -37,6 +41,7 @@ from .model import LoopedLM, ModelConfig
 from .objective import loss_and_stats, pad_to_multiple, to_device
 
 GATE_FAILED = 3  # exit status of a run stopped by its gate
+CURRICULUM_FAILED = 4  # exit status of a run whose curriculum stage reached its step limit
 DEFAULT_EVAL_SETS = ("grid/d1_b1,grid/d2_b2,grid/d4_b2,grid/d8_b1,grid/d8_b4,grid/d16_b4,"
                      "mixed/q4_in_distribution")
 
@@ -52,6 +57,7 @@ class TrainConfig:
     gate_step: int = 0                               # 0: off; else stop at this step unless the gate metric passes
     gate_threshold: float = 0.9                      # the gate: gate_metric(task) above this at gate_step
     gate_enforce: bool = True                        # false: record the gate (gate.json, gate/passed) but never stop
+    curriculum: str = ""                             # curriculum file (looped_lm/curriculum.py); "": data_config throughout
     batch_size: int = 64
     steps: int = 50000
     lr: float = 1e-3
@@ -170,9 +176,12 @@ def _wandb_id(cfg: TrainConfig) -> str:
         return f.read().strip()
 
 
-def _check_resume(saved: dict, model_cfg: ModelConfig, cfg: TrainConfig, task: TaskConfig) -> None:
-    """A resumed run must have the same model and the same data stream."""
+def _check_resume(saved: dict, model_cfg: ModelConfig, cfg: TrainConfig, task: TaskConfig,
+                  cur: Optional[Curriculum] = None) -> None:
+    """A resumed run must have the same model and the same data stream (and curriculum)."""
     problems = []
+    if saved.get("curriculum") != (cur.to_dict() if cur is not None else None):
+        problems.append("curriculum")
     if saved["model_config"] != model_cfg.to_dict():
         problems.append("model config")
     if saved["task_config"] != task.to_dict():
@@ -207,8 +216,22 @@ def train(cfg: TrainConfig, model_cfg: ModelConfig, task: Optional[TaskConfig] =
           stop_after: Optional[int] = None, record_losses: bool = False) -> dict:
     """Train (or resume) a run. stop_after: stop with a checkpoint once this step is reached, as if
     interrupted (tests). Returns {"step", "losses" (per step, with record_losses), "benchmark",
-    "gate_failed"}."""
+    "gate_failed", "curriculum" (its status, with a curriculum)}."""
     task = task if task is not None else load_task(cfg)
+    cur = Curriculum.load(cfg.curriculum) if cfg.curriculum else None
+    stage_tasks = None
+    if cur is not None:
+        if not isinstance(task, TaskConfig):
+            raise ValueError("a curriculum needs a graph-task data config")
+        stage_tasks = cur.stage_tasks(task)
+        log_path = os.path.join(cfg.run_dir, "curriculum.json")
+        if not cfg.benchmark and os.path.exists(log_path):
+            with open(log_path) as f:
+                done = json.load(f)
+            if done["status"] != "running" and done["curriculum"] == cur.to_dict():
+                print(f"{cfg.run_dir}: curriculum already {done['status']} at stage {done['stage'] + 1}; "
+                      f"not restarting it", flush=True)
+                return {"step": done["stages"][-1]["end_step"], "losses": [], "curriculum": done["status"]}
     if cfg.gate_step:
         if cfg.gate_step % cfg.log_interval or cfg.gate_step > cfg.steps:
             raise ValueError(f"gate_step {cfg.gate_step} must be a multiple of log_interval {cfg.log_interval} "
@@ -227,19 +250,24 @@ def train(cfg: TrainConfig, model_cfg: ModelConfig, task: Optional[TaskConfig] =
     bench = cfg.benchmark
     os.makedirs(cfg.run_dir, exist_ok=True)
     configs = {"model": model_cfg.to_dict(), "train": dataclasses.asdict(cfg), "task": task.to_dict()}
+    if cur is not None:
+        configs["curriculum"] = cur.to_dict()
 
     torch.manual_seed(cfg.seed)
     model = LoopedLM(model_cfg).to(device)
     optimizer = torch.optim.AdamW(param_groups(model, cfg.weight_decay), lr=cfg.lr, betas=(cfg.beta1, cfg.beta2),
                                   fused=device.type == "cuda")
     step = 0
+    cstate = initial_state(cur) if cur is not None else None
     ckpt_path = os.path.join(cfg.run_dir, "ckpt_latest.pt")
     if os.path.exists(ckpt_path) and not bench:
         saved = torch.load(ckpt_path, map_location=device, weights_only=False)
-        _check_resume(saved, model_cfg, cfg, task)
+        _check_resume(saved, model_cfg, cfg, task, cur)
         model.load_state_dict(saved["model"])
         optimizer.load_state_dict(saved["optimizer"])
         step = saved["step"]
+        if cur is not None:
+            cstate = saved["curriculum_state"]
         print(f"resumed {cfg.run_dir} at step {step}", flush=True)
     elif cfg.init_from:
         init_weights(model, cfg.init_from, model_cfg, device)
@@ -247,6 +275,8 @@ def train(cfg: TrainConfig, model_cfg: ModelConfig, task: Optional[TaskConfig] =
     if step == 0 and not bench:
         with open(os.path.join(cfg.run_dir, "config.json"), "w") as f:
             json.dump(configs, f, indent=1)
+        if cur is not None:
+            write_log(cfg.run_dir, cur, cstate)
     if step >= cfg.steps:
         print(f"{cfg.run_dir}: already at step {step} of {cfg.steps}", flush=True)
         return {"step": step, "losses": []}
@@ -254,22 +284,33 @@ def train(cfg: TrainConfig, model_cfg: ModelConfig, task: Optional[TaskConfig] =
     def checkpoint(milestone: bool = False):
         payload = {"model": model.state_dict(), "optimizer": optimizer.state_dict(), "step": step,
                    "model_config": model_cfg.to_dict(), "train_config": dataclasses.asdict(cfg),
-                   "task_config": task.to_dict()}
+                   "task_config": task.to_dict(), "curriculum": cur.to_dict() if cur is not None else None,
+                   "curriculum_state": cstate}
         _save(ckpt_path, payload)
         if milestone:
             _save(os.path.join(cfg.run_dir, f"model_step_{step}.pt"),
                   {k: payload[k] for k in ("model", "step", "model_config", "train_config", "task_config")})
 
     diagnostic = isinstance(task, (MqarConfig, InductionConfig))
-    if diagnostic:
-        cls = MqarStream if isinstance(task, MqarConfig) else InductionStream
-        stream = cls(task, seed=cfg.stream_seed, batch_size=cfg.batch_size, start=step)
-    else:
-        stream = TrainStream(task, seed=cfg.stream_seed, batch_size=cfg.batch_size, start=step,
-                             allow_small_pool=cfg.allow_small_pool)
-    loader = DataLoader(stream, batch_size=None, num_workers=cfg.num_workers, pin_memory=device.type == "cuda",
-                        prefetch_factor=4 if cfg.num_workers > 0 else None,
-                        persistent_workers=False)
+
+    def make_loader():
+        """The data from the current step on; with a curriculum, the current stage's stream from the
+        step within the stage."""
+        if diagnostic:
+            cls = MqarStream if isinstance(task, MqarConfig) else InductionStream
+            stream = cls(task, seed=cfg.stream_seed, batch_size=cfg.batch_size, start=step)
+        elif cur is not None:
+            k = cstate["stage"]
+            stream = TrainStream(stage_tasks[k], seed=cfg.stream_seed, batch_size=cfg.batch_size,
+                                 start=step - cstate["stage_start"], allow_small_pool=cfg.allow_small_pool,
+                                 stream=stream_of(k))
+        else:
+            stream = TrainStream(task, seed=cfg.stream_seed, batch_size=cfg.batch_size, start=step,
+                                 allow_small_pool=cfg.allow_small_pool)
+        return DataLoader(stream, batch_size=None, num_workers=cfg.num_workers, pin_memory=device.type == "cuda",
+                          prefetch_factor=4 if cfg.num_workers > 0 else None, persistent_workers=False)
+
+    loader = make_loader()
     fwd = torch.compile(model) if cfg.compile else model
     pad_multiple = cfg.pad_multiple or (128 if cfg.compile else 1)
 
@@ -281,6 +322,13 @@ def train(cfg: TrainConfig, model_cfg: ModelConfig, task: Optional[TaskConfig] =
                 raise FileNotFoundError(f"evaluation set {path} not found: write the suite first "
                                         f"(python -m looped_lm.dataset_generation.cli write --suite ...)")
             eval_data[name] = load_set(path, cfg.eval_samples, cfg.eval_max_tokens)
+    check_data = {}
+    if cur is not None and not bench:  # every stage's check set, so a missing one fails at the start
+        for st in cur.stages:
+            path = os.path.join(cfg.eval_suite, st.check_set)
+            if not os.path.exists(os.path.join(path, "meta.json")):
+                raise FileNotFoundError(f"curriculum check set {path} not found: write the suite first")
+            check_data[st.check_set] = load_set(path, cur.check_samples, cfg.eval_max_tokens)
 
     stop = _Stop()
     old_handlers = {s: signal.signal(s, stop) for s in (signal.SIGUSR1, signal.SIGTERM)}
@@ -299,6 +347,11 @@ def train(cfg: TrainConfig, model_cfg: ModelConfig, task: Optional[TaskConfig] =
                         f"eval/{name}/first_query_chance": r["first_query_chance"]})
             for key in ("first_query_by_depth", "first_query_by_branching"):  # sets mixing d (b) only
                 out.update({f"eval/{name}/first_query_accuracy_{k}": s["accuracy"] for k, s in r.get(key, {}).items()})
+            out.update({f"eval/{name}/exact_match": r["exact_match"],
+                        f"eval/{name}/first_query_exact_match": r["first_query_exact_match"]})
+            for key in ("exact_match_by_depth", "first_query_exact_match_by_depth"):  # sets mixing depths only
+                metric = key[:-len("_by_depth")]
+                out.update({f"eval/{name}/{metric}_{k}": s["accuracy"] for k, s in r.get(key, {}).items()})
         out.update({f"model/{k}": v for k, v in model.embed_norms().items()})
         return out
 
@@ -343,6 +396,20 @@ def train(cfg: TrainConfig, model_cfg: ModelConfig, task: Optional[TaskConfig] =
                     n, k = a[f"first_n_by_{key}"], a[f"first_correct_by_{key}"]
                     by_db.update({f"train/first_query_accuracy_{prefix}{i}": k[i] / n[i]
                                   for i in range(1, len(n)) if n[i] > 0})
+                # exact match (every answer token right), all queries and first queries, also by depth
+                exact = {}  # (none on tasks without queries: induction)
+                if a["exact_n"] > 0:
+                    exact = {"train/exact_match": a["exact_correct"] / a["exact_n"],
+                             "train/first_query_exact_match": a["first_exact_correct"] / max(1, a["first_n"])}
+                n, nf = a["exact_n_by_depth"], a["first_n_by_depth"]
+                for i in range(1, len(n)):
+                    if n[i] > 0:
+                        exact[f"train/exact_match_d{i}"] = a["exact_correct_by_depth"][i] / n[i]
+                    if nf[i] > 0:
+                        exact[f"train/first_query_exact_match_d{i}"] = a["first_exact_correct_by_depth"][i] / nf[i]
+                if cur is not None:
+                    exact.update({"curriculum/stage": cstate["stage"] + 1,
+                                  "curriculum/stage_step": step - cstate["stage_start"]})
                 dt = time.time() - t_last
                 if cfg.gate_step and step == cfg.gate_step:
                     metric = gate_metric(task)
@@ -364,7 +431,7 @@ def train(cfg: TrainConfig, model_cfg: ModelConfig, task: Optional[TaskConfig] =
                                 "train/other_accuracy": a["other_correct"] / max(1, a["other_n"]),
                                 "train/after_special_share": a["after_special_n"] / max(1, a["final_n"]),
                                 "train/supervised_fraction": a["loss_tokens"] / max(1, a["real_tokens"])}
-                               if "after_special_n" in a else {}), **by_db,
+                               if "after_special_n" in a else {}), **by_db, **exact,
                             "train/grad_norm": a["grad_norm"] / a["steps"], "train/clip_fraction": a["clipped"] / a["steps"],
                             "train/lr": lr_at(step - 1, cfg),
                             "train/tokens_per_s": a["real_tokens"] / dt, "train/padded_tokens_per_s": a["padded_tokens"] / dt,
@@ -374,13 +441,35 @@ def train(cfg: TrainConfig, model_cfg: ModelConfig, task: Optional[TaskConfig] =
                 print(f"gate failed at step {step}: {gate['metric']} {gate[gate['metric']]:.3f}, "
                       f"not above {cfg.gate_threshold}; stopping without a checkpoint", flush=True)
                 break
-            if cfg.eval_interval > 0 and (step % cfg.eval_interval == 0 or step == cfg.steps):  # norms even without sets
-                logger.log(run_eval(), step=step)
+            stage_event = None
+            if cur is not None and (step - cstate["stage_start"]) % cur.check_interval == 0 \
+                    and step > cstate["stage_start"]:
+                k = cstate["stage"]
+                r = evaluate_set(model, check_data[cur.stages[k].check_set], device)
+                value = r[cur.check_metric]
+                stage_event = after_check(cur, cstate, step, value)
+                logger.log({"curriculum/check": value, "curriculum/check_stage": k + 1}, step=step)
                 t_last = time.time()
-            done = step == cfg.steps or stop.requested or (stop_after is not None and step >= stop_after)
+                if stage_event is not None:
+                    write_log(cfg.run_dir, cur, cstate)
+                    print(f"step {step}: stage {k + 1} ({cur.stages[k].name}) {stage_event}, "
+                          f"{cur.check_metric} {value:.3f}", flush=True)
+                if stage_event == "advanced":  # the next stage's stream, from its step 0
+                    del it
+                    loader = make_loader()
+                    it = iter(loader)
+            cur_done = cstate is not None and cstate["status"] != "running"
+            if cfg.eval_interval > 0 and (step % cfg.eval_interval == 0 or step == cfg.steps or stage_event):
+                logger.log(run_eval(), step=step)  # also at every stage change; norms even without sets
+                t_last = time.time()
+            done = step == cfg.steps or stop.requested or (stop_after is not None and step >= stop_after) or cur_done
             if done or (cfg.ckpt_interval and step % cfg.ckpt_interval == 0) or \
                     (cfg.keep_interval and step % cfg.keep_interval == 0):
-                checkpoint(milestone=bool(cfg.keep_interval and step % cfg.keep_interval == 0) or step == cfg.steps)
+                checkpoint(milestone=bool(cfg.keep_interval and step % cfg.keep_interval == 0) or step == cfg.steps
+                           or cur_done)
+            if cur_done:
+                print(f"curriculum {cstate['status']} at step {step}", flush=True)
+                break
             if stop.requested:
                 print(f"{stop.requested}: checkpoint saved at step {step}, stopping", flush=True)
                 break
@@ -391,7 +480,8 @@ def train(cfg: TrainConfig, model_cfg: ModelConfig, task: Optional[TaskConfig] =
             signal.signal(s, h)
         if logger is not None:
             logger.finish()
-    result = {"step": step, "losses": losses, "gate_failed": gate_failed}
+    result = {"step": step, "losses": losses, "gate_failed": gate_failed,
+              "curriculum": cstate["status"] if cstate is not None else None}
     if bench:
         skip = min(30, len(step_times) // 3)
         st, wt = step_times[skip:], waits[skip:]
@@ -433,8 +523,11 @@ def main(argv=None):
     cfg, model_cfg = parse_args(argv)
     if cfg.benchmark:
         cfg = dataclasses.replace(cfg, eval_interval=0)
-    if train(cfg, model_cfg).get("gate_failed"):
+    result = train(cfg, model_cfg)
+    if result.get("gate_failed"):
         return GATE_FAILED
+    if result.get("curriculum") == "failed":
+        return CURRICULUM_FAILED
 
 
 if __name__ == "__main__":

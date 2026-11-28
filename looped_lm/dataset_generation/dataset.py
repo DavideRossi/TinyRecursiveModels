@@ -92,10 +92,12 @@ class TrainStream(IterableDataset):
     Use DataLoader(stream, batch_size=None, num_workers=W): workers take turns (worker w makes
     items w, w + W, ...) and the loader returns them in order, so the stream is the same for any W.
     With several ranks, rank r of R takes every R-th sample (or batch) starting at r.
+    stream: the generator's stream id (generate.make_sample); different streams of the same
+    (config, seed) are independent (the curriculum gives each stage its own).
     """
 
     def __init__(self, config: TaskConfig, seed: int = 0, batch_size: Optional[int] = None, start: int = 0,
-                 rank: int = 0, world_size: int = 1, allow_small_pool: bool = False):
+                 rank: int = 0, world_size: int = 1, allow_small_pool: bool = False, stream: int = 0):
         if config.pool_size != NODE_POOL and not allow_small_pool:
             raise ValueError(f"training must draw names from the full pool of {NODE_POOL} "
                              f"(got pool_size={config.pool_size}); allow_small_pool=True for debugging only")
@@ -103,13 +105,13 @@ class TrainStream(IterableDataset):
         if not 0 <= rank < world_size:
             raise ValueError(f"rank {rank} outside world size {world_size}")
         self.config, self.seed, self.batch_size, self.start = config, seed, batch_size, start
-        self.rank, self.world_size = rank, world_size
+        self.rank, self.world_size, self.stream = rank, world_size, stream
 
     def item(self, j: int):
         """Item j of the global stream (a sample, or a batch with batch_size)."""
         if self.batch_size is None:
-            return to_item(make_batch(self.config, self.seed, j, 1, "train")[0], j)
-        samples = make_batch(self.config, self.seed, j, self.batch_size, "train")
+            return to_item(make_batch(self.config, self.seed, j, 1, "train", self.stream)[0], j)
+        samples = make_batch(self.config, self.seed, j, self.batch_size, "train", self.stream)
         return collate([to_item(s, j * self.batch_size + k) for k, s in enumerate(samples)])
 
     def __iter__(self) -> Iterator:

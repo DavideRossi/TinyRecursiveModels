@@ -3,5 +3,6 @@
     dataset_generation/   the data: generator, checker, audit, suites, PyTorch datasets
     model/                the model family (ModelConfig, LoopedLM)
     train.py, evaluate.py training and evaluation (python -m looped_lm.train / looped_lm.evaluate)
+    curriculum.py         data curricula for train.py (--curriculum); configs/ holds the files
     diagnostics/          MQAR and induction pretraining, checks of the training stack
 """

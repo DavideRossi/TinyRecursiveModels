@@ -1,0 +1,18 @@
+{
+ "threshold": 0.9,
+ "check_metric": "first_query_exact_match",
+ "check_interval": 250,
+ "check_samples": 1000,
+ "max_stage_steps": 10000,
+ "stages": [
+  {"name": "d1", "check_set": "cfg/train_d1",
+   "overrides": {"depth": 1}},
+  {"name": "d1-2", "check_set": "cfg/train_d2",
+   "overrides": {"depth": {"values": [1, 2], "probs": [0.5, 0.5]}}},
+  {"name": "d1-4", "check_set": "cfg/train_d4",
+   "overrides": {"depth": {"values": [1, 2, 3, 4], "probs": [0.25, 0.25, 0.25, 0.25]}}},
+  {"name": "d1-8", "check_set": "cfg/train_d8",
+   "overrides": {"depth": {"values": [1, 2, 3, 4, 5, 6, 7, 8],
+                           "probs": [0.125, 0.125, 0.125, 0.125, 0.125, 0.125, 0.125, 0.125]}}}
+ ]
+}

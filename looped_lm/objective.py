@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from .dataset_generation.vocab import PAD
 
 ROLE_FINAL, ROLE_END = 1, 5
+ANSWER_ROLES = (1, 2, 3, 4)  # final, intermediate, bracket, backtrack: the answer, without its end token
 MAX_DEPTH, MAX_BRANCHING = 32, 8  # bins of the first-query counts by d and b (larger values go in the last)
 DEVICE_KEYS = ("tokens", "loss_mask", "role", "pred_pos", "depth", "branching", "query_index", "after_special")
 
@@ -47,13 +48,44 @@ def loss_positions(loss_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]
     return m.nonzero(as_tuple=True)
 
 
+def query_exact(batch: dict, b: torch.Tensor, t: torch.Tensor, correct: torch.Tensor) -> torch.Tensor:
+    """For each scored token (b, t): whether every answer token of its query (roles 1-4) is correct.
+    Meaningful at the tokens of a query (query_index >= 0); no host synchronization."""
+    qi = batch["query_index"][b, t]
+    answer = torch.zeros_like(correct)
+    for r in ANSWER_ROLES:
+        answer |= batch["role"][b, t] == r
+    answer &= qi >= 0
+    key = b * batch["tokens"].shape[1] + qi.clamp(min=0)  # one bin per (row, query); query index < length
+    wrong = torch.zeros(batch["tokens"].numel(), dtype=torch.long, device=correct.device)
+    wrong = wrong.index_add(0, key, (answer & ~correct).long())
+    return wrong[key] == 0
+
+
+def exact_match_counts(batch: dict, b, t, correct, final) -> Dict[str, torch.Tensor]:
+    """Exact-match counts (see loss_and_stats), one per query: at its final answer token."""
+    q = final & (batch["query_index"][b, t] >= 0)
+    first = q & (batch["query_index"][b, t] == 0)
+    ok = query_exact(batch, b, t, correct)
+    d = batch["depth"][b, t].clamp(0, MAX_DEPTH).long()
+    bins = torch.zeros(MAX_DEPTH + 1, dtype=torch.long, device=d.device)
+    return {"exact_n": q.sum(), "exact_correct": (q & ok).sum(), "first_exact_correct": (first & ok).sum(),
+            "exact_n_by_depth": bins.index_add(0, d, q.long()),
+            "exact_correct_by_depth": bins.index_add(0, d, (q & ok).long()),
+            "first_exact_correct_by_depth": bins.index_add(0, d, (first & ok).long())}
+
+
 def loss_and_stats(model, batch: dict) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Mean cross-entropy over the loss tokens of the batch, and device-side counts for logging:
     final answers (role 1), the final answers of each sample's first query (query_index 0: no
     earlier answer in the context, so no elimination), and end tokens (role 5), each with the
     number correct (argmax). The first queries are also counted by the query's d and b
     (first_n_by_depth[d], first_correct_by_depth[d], and _by_branching; bin 0 holds the tasks
-    without d and b: MQAR, induction). Batches with an after_special field (the induction diagnostic) also
+    without d and b: MQAR, induction). Exact match: a query is right when every token of its answer
+    (roles 1-4, not the end token) is right under teacher forcing, which is exactly when greedy
+    decoding reproduces the answer; in the direct format it is the final answer's accuracy.
+    Counted over all queries (exact_n, exact_correct) and first queries (first_exact_correct;
+    their number is first_n), and both by depth. Batches with an after_special field (the induction diagnostic) also
     count the final answers that follow a special token, and the other final answers."""
     tokens = batch["tokens"]
     hidden = model(tokens)
@@ -75,6 +107,7 @@ def loss_and_stats(model, batch: dict) -> Tuple[torch.Tensor, Dict[str, torch.Te
         bins = torch.zeros(top + 1, dtype=torch.long, device=v.device)  # fixed size: no host sync (bincount has one)
         stats[f"first_n_by_{key}"] = bins.index_add(0, v, first.long())
         stats[f"first_correct_by_{key}"] = bins.index_add(0, v, (first & correct).long())
+    stats.update(exact_match_counts(batch, b, t, correct, final))
     if "after_special" in batch:
         after = final & batch["after_special"][b, t]
         other = final & ~after

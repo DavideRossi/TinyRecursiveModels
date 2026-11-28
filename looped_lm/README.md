@@ -10,14 +10,16 @@ has no link to the TRM code in this repository.
 looped_lm/
   dataset_generation/   the data (see its README)
   model/                ModelConfig, LoopedLM, layers
-  objective.py          the training loss (cross-entropy at loss_mask positions)
+  objective.py          the training loss (cross-entropy at loss_mask positions), exact match
   evaluation.py         teacher-forced scoring of final answers on stored sets
   train.py              training loop: python -m looped_lm.train
+  curriculum.py         curricula of data stages for train.py (--curriculum)
+  configs/              curriculum files (curriculum_depth.json)
   evaluate.py           evaluation of a checkpoint: python -m looped_lm.evaluate
   diagnostics/          MQAR and induction pretraining, checks of the training stack (§6)
   data/                 written evaluation suites (ignored by git)
 slurm/train_looped_lm.sbatch, slurm/bench_looped_lm.sbatch
-tests/looped_lm/test_model.py, tests/looped_lm/test_mqar.py
+tests/looped_lm/: test_model.py, test_curriculum.py, test_mqar.py, test_induction.py
 ```
 
 ## 1. Model (`model/`)
@@ -121,6 +123,7 @@ Every field of `TrainConfig` and `ModelConfig` is an option (`--field value`; bo
 | `metrics.jsonl` | every logged metric, one JSON line per log, with `step` |
 | `ckpt_latest.pt` | model, optimizer, step and configs: everything to resume (every `ckpt_interval` = 2,000 steps, at the end, and on a signal) |
 | `model_step_N.pt` | weights and configs only, every `keep_interval` = 10,000 steps and at the end, for evaluation along training |
+| `gate.json`, `curriculum.json` | the gate's result (`--gate_step`), the curriculum's stage log (`--curriculum`) |
 | `wandb/`, `wandb_id.txt` | the wandb run (offline unless `WANDB_MODE` says otherwise) |
 
 **Resuming:** starting a run whose directory has `ckpt_latest.pt` resumes it: model, optimizer,
@@ -148,13 +151,45 @@ again does nothing (exit status 3). It costs N steps; see the two-phase recipe i
 **`--gate_enforce false`** only records the gate (`gate.json` with `"enforced": false`,
 `gate/passed`) and never stops the run, to calibrate the gate step.
 
+**Curriculum: `--curriculum FILE`** (`curriculum.py`; off by default). The file lists stages,
+each a set of overrides of `--data_config` and a check set of the suite, plus `threshold`,
+`check_metric` (default `first_query_exact_match`), `check_interval`, `check_samples` and
+`max_stage_steps`. The run starts in stage 1. Every `check_interval` steps within a stage it
+evaluates the check metric on the first `check_samples` samples of the stage's check set. When
+it reaches the threshold (≥), the next stage starts from the next step. The model, optimizer
+and learning-rate schedule carry on; only the data change. The run ends when the last stage
+passes ("completed"), or when a stage has run `max_stage_steps` steps without passing
+("failed": exit status 4, so the Slurm job fails). Either way it saves `ckpt_latest.pt` and
+`model_step_N.pt` and runs the periodic evaluation. `--steps` is only a cap.
+- **Data:** stage k draws batch j (its j-th step) from stream k of the training split, so the
+  data are a pure function of (seed, stage, step within stage), and stages never share batches.
+- **Resuming** restores the stage and its start step, and refuses another curriculum file. A run
+  whose curriculum has ended is not restarted (exit status 4 again if it failed).
+- **Logged:** `curriculum/stage` (1-based) and `curriculum/stage_step` every `log_interval`;
+  `curriculum/check` and `curriculum/check_stage` at every check. The periodic evaluation also
+  runs at every stage change.
+- **`curriculum.json`** in the run directory, rewritten at every change: `status` (running |
+  completed | failed), the current stage and its start step, and per stage started its name,
+  `start_step`, `end_step`, `reason` (advanced | completed | max_steps | running) and the last
+  check value.
+- **`configs/curriculum_depth.json`** (§6, "Depth curriculum") grows the depth of train.json:
+  stage 1 depth 1, then depths 1–2, 1–4 and 1–8. Each stage gives half its queries to the
+  depths new in it and half to the earlier ones, uniform within each: 1/2 each in stage 2, which
+  makes stages 3 and 4 uniform over their depths. Stage 4 is therefore train.json itself.
+  Branching 1–4, T 5–12 and 192–512 edges per batch are those of train.json in every stage.
+  Each stage is checked at its maximum depth, on `cfg/train_d1`, `_d2`, `_d4` and `_d8`
+  (threshold 0.9, every 250 steps, 1,000 samples, at most 10,000 steps per stage).
+
 **Logged every `log_interval` = 50 steps** (averages over the interval): `train/loss`,
 `train/final_loss` (final answers only), `train/final_accuracy` (role 1, argmax),
 `train/first_query_accuracy` (the final answers of each sample's first query only: with
 teacher forcing, later queries see the earlier answers and can rule those targets out, the
 `elimination` heuristic, so only the first query has a clean chance level),
 `train/first_query_accuracy_d<d>` and `_b<b>` (the same by the first query's depth and by its
-branching, for the values present in the interval; graph tasks only), `train/end_accuracy` (role 5), `train/grad_norm` (before clipping), `train/clip_fraction`
+branching, for the values present in the interval; graph tasks only),
+`train/exact_match` and `train/first_query_exact_match` (a query is right when every token of
+its answer is right; also `_d<d>` by depth), `train/end_accuracy` (role 5),
+`train/grad_norm` (before clipping), `train/clip_fraction`
 (share of the interval's steps whose norm exceeded `grad_clip`, i.e. were clipped), `train/lr`,
 `train/tokens_per_s` (real tokens; `padded_tokens_per_s` with padding), `train/step_time`,
 `train/data_wait` (time per step spent waiting for the DataLoader; if it approaches the step
@@ -167,7 +202,8 @@ time, add workers).
 `mixed/q4_in_distribution`. Per set it logs `eval/<set>/accuracy`, `eval/<set>/loss` (mean
 cross-entropy on final answers), `eval/<set>/chance`, `eval/<set>/n`, and
 `eval/<set>/first_query_accuracy` / `eval/<set>/first_query_chance` (first queries only), and
-for sets that mix depths (branchings) `eval/<set>/first_query_accuracy_d<d>` (`_b<b>`). **Watch the loss as well
+for sets that mix depths (branchings) `eval/<set>/first_query_accuracy_d<d>` (`_b<b>`), and
+`eval/<set>/exact_match` / `first_query_exact_match` (with `_d<d>` for sets mixing depths). **Watch the loss as well
 as the accuracy:** on these tasks accuracy can sit at chance and then jump, and the loss usually
 moves first. The run fails at start if a set is missing (write the suite first, §4). At step 0
 and at every evaluation it also logs the mean and maximum L2 norm of the embedding rows, over
@@ -178,8 +214,9 @@ the whole vocabulary (`model/embed_norm_mean`, `model/embed_norm_max`) and over 
 `configs/eval_suite.json` turns a training config into a fixed set of the same distribution
 (the eval split, so never a sample of the training stream). It holds `cfg/lookup_q16` and
 `cfg/lookup_long` (1,000 samples each of `diag_lookup_q16.json` and `diag_lookup_long.json`)
-and `cfg/train` (2,000 samples of `train.json`, about 250 first queries per depth); add one
-entry per training config used. Write only these
+and `cfg/train` (2,000 samples of `train.json`, about 250 first queries per depth), and
+`cfg/train_d1`, `_d2`, `_d3`, `_d4`, `_d6`, `_d8` (1,000 samples each of `train.json` with the
+depth fixed, for the depth curriculum); add one entry per training config used. Write only these
 sets with `cli write --suite looped_lm/dataset_generation/configs/eval_suite.json --only cfg/`
 (seconds; the other sets are untouched), and evaluate on them with e.g.
 `--eval_sets cfg/lookup_q16,grid/d1_b1 --eval_samples 1000`.
@@ -205,6 +242,12 @@ python -m looped_lm.evaluate --checkpoint checkpoints/looped_lm/RUN/model_step_2
   answers alone reaches (1/T + … + 1/(T − q + 1)) / q, e.g. 0.095 for 16 queries over 20
   targets, against chance 0.05). For sets with several queries per sample (the mixed sets), the same by the
   query's (d, b).
+- **Exact match** (`exact_match`, `first_query_exact_match`, and by depth for sets mixing
+  depths): a query is right when every token of its answer (roles 1–4: final, intermediate,
+  bracket, backtrack; not the end token) is right under teacher forcing. That is exactly when
+  greedy decoding reproduces the answer. In the direct format it equals the final answer's
+  accuracy. In the path, frontier and dfs formats it is the measure to use: the final answer
+  alone is predicted with the path so far given, so its accuracy measures one step only.
 - **Output:** `<run>/eval/<checkpoint>_step<N>.json` (all results, configs and paths) and `.csv`
   (one row per set, plus one per (d, b) with the `depth` and `branching` columns filled), for
   comparing runs in a notebook. `--out` changes the directory.
@@ -425,13 +468,56 @@ with `--dependency=afterok` on it. `afternotok` also starts the fallback after a
 time-out, so check `gate.json` of the first run. A run that passed its gate is unaffected by
 it.
 
+### Depth curriculum
+
+**Why.** train.json directly does not work from the two-phase weights (20,000 steps, lr 3e-4,
+5 seeds, from the phase 2 long checkpoints and from the phase 1 long checkpoints). The lookup
+skill transfers as "copy a successor of the source": at depth 1, first-query accuracy starts
+at about 0.5, the mean of 1/b over branching 1–4. But depths 2–8, 7/8 of the queries, are
+confidently wrong at the start (final loss 14–17). Within 750–3,000 steps the model falls to
+choosing among the listed targets at chance, depth 1 included. Only 2 of 3 L8 runs from the
+phase 2 checkpoints came back at depth 1 (grid d1_b1 0.85–0.90 at step 20,000); no run passed
+chance at depth 2 or beyond. From the phase 1 checkpoints, every run stayed at chance.
+
+**The curriculum** `configs/curriculum_depth.json` (§2) starts at depth 1 with branching 1–4,
+where the model has to pick, among the source's children, the one that is a target. It then
+adds depths 2, 3–4 and 5–8. Each stage must reach first-query exact match 0.9 at its maximum
+depth (`cfg/train_d<d>`), with at most 10,000 steps per stage. The learning rate is constant
+after warm-up (`--min_lr_ratio 1.0`), since the run length is not known in advance. Write the
+check sets with `cli write --only cfg/train_d` (§2), then:
+
+```bash
+RUN_NAME=curr_L8_s0 DEPTH=8 WIDTH=256 SEED=0 sbatch --time=02:00:00 slurm/train_looped_lm.sbatch \
+    --curriculum looped_lm/configs/curriculum_depth.json --steps 40000 --lr 3e-4 --min_lr_ratio 1.0 \
+    --compile true --eval_interval 1000 --eval_samples 1000 \
+    --eval_sets cfg/train_d1,cfg/train_d2,cfg/train_d3,cfg/train_d4,cfg/train_d6,cfg/train_d8 \
+    --init_from checkpoints/looped_lm/PHASE2_RUN/model_step_10000.pt
+```
+
+`curriculum.json` in the run directory then gives the steps spent in each stage and where the
+run ended.
+
 ## 7. Tests
 
 ```bash
-python tests/looped_lm/test_model.py      # 9 tests, CPU, under a minute
-python tests/looped_lm/test_mqar.py       # 5 tests
-python tests/looped_lm/test_induction.py  # 8 tests
+python tests/looped_lm/test_model.py       # 10 tests, CPU, under a minute
+python tests/looped_lm/test_curriculum.py  # 6 tests
+python tests/looped_lm/test_mqar.py        # 5 tests
+python tests/looped_lm/test_induction.py   # 8 tests
 ```
+
+- **Curriculum:** the depth curriculum's stages are train.json with only the depth changed,
+  with half the probability on the depths new in each stage and half on the earlier ones,
+  each half uniform; the check sets are at each stage's maximum depth and exist in the suite
+  as train.json with that depth. A stage's stream is deterministic in (seed, stage, step
+  within stage), differs from other stages and seeds, and has the stage's depth mix. The
+  stage logic advances, completes and fails at the step limit, and rejects invalid files. A
+  run with checks that always pass goes through the stages at the expected steps, logs the
+  stage, writes `curriculum.json` and a final `model_step_N.pt`, and is not restarted. A run
+  interrupted mid-stage and resumed (across a stage change) gives the same losses as an
+  uninterrupted one. A run doesn't resume under another curriculum file. A stage that never
+  passes stops the run at its limit, with a checkpoint, the stage log and exit status 4, and
+  is not restarted. A missing check set fails at the start.
 
 - **Induction:** every supervised token is determined by the context (each earlier occurrence
   of its one or two preceding tokens, ending in a name, is followed by it); never two specials in
@@ -466,6 +552,9 @@ python tests/looped_lm/test_induction.py  # 8 tests
 - **Loss:** equal to the cross-entropy of the full logits at the masked positions (so the head
   at loss positions only is exact); unmasking one answer removes exactly its term; padding never
   contributes (arbitrary tokens in place of `<pad>`, or each sample alone, give the same loss).
+- **Exact match:** in the path format, a wrong intermediate node leaves every final answer
+  right but its query wrong, in the objective's counts (all queries, first queries, by depth)
+  and in the evaluation alike; in the direct format, exact match equals final-answer accuracy.
 - **Evaluation:** with an oracle stub whose hidden state at position p encodes the token at
   p + 1, every answer is correct, chance and the Wilson interval are right, and the (d, b)
   breakdown adds up; the first-query results by depth and by branching count each value's first

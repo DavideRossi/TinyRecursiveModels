@@ -108,6 +108,9 @@ grid_cell = StoredDataset("looped_lm/data/eval_suite/grid/d16_b4")
 eval_loader = DataLoader(grid_cell, batch_size=64, collate_fn=collate)
 ```
 
+`TrainStream(..., stream=k)` draws from another stream of the same (config, seed): streams never
+share samples (the looped_lm curriculum gives each stage its own).
+
 `write` writes to `looped_lm/data/<suite file name>` unless `--out` says otherwise. Every `data/`
 directory is ignored by git, so generated sets stay out of the repository.
 
@@ -565,7 +568,10 @@ JSON (path relative to the suite file) and optional `overrides`; `base` does not
 has the training config's distribution, from the eval split, so it never contains a sample of
 the training stream: a fixed measure of the training distribution. `cfg/lookup_q16` and
 `cfg/lookup_long`: 1,000 samples each, 246 and 1,072 tokens on average; `cfg/train`: 2,000
-samples of `train.json`, 1,085 tokens on average, 227–280 first queries per depth.
+samples of `train.json`, 1,085 tokens on average, 227–280 first queries per depth;
+`cfg/train_d1`, `_d2`, `_d3`, `_d4`, `_d6`, `_d8`: 1,000 samples each of `train.json` with
+the depth fixed (`overrides`), 1,064–1,085 tokens on average (the check sets of the depth
+curriculum, looped_lm/README.md §2).
 
 **Skipping sections:** `write`, `stats` and `audit` take `--skip companion/ diag/` (any name
 prefixes) to leave sets out; `--only` selects instead (`write --only cfg/` writes only the
